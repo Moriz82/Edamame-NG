@@ -1,2 +1,9 @@
 cve	platform	product	kev_date	reference
+CVE-2023-2640	linux	Ubuntu OverlayFS		https://ubuntu.com/security/CVE-2023-2640
+CVE-2023-32629	linux	Ubuntu OverlayFS		https://ubuntu.com/security/CVE-2023-32629
 CVE-2023-4911	linux	glibc		https://www.qualys.com/2023/10/03/cve-2023-4911/looney-tunables-local-privilege-escalation-glibc-ld-so.txt
+CVE-2024-0132	linux	NVIDIA Container Toolkit		https://github.com/NVIDIA/libnvidia-container/security/advisories/GHSA-q2v4-jw5g-9xxj
+CVE-2024-21626	linux	runc		https://github.com/opencontainers/runc/security/advisories/GHSA-xr7r-f8xq-vfvv
+CVE-2025-31133	linux	runc		https://github.com/opencontainers/runc/security/advisories/GHSA-9493-h29p-rfm2
+CVE-2025-52565	linux	runc		https://github.com/opencontainers/runc/security/advisories/GHSA-qw9x-cqr3-wc7r
+CVE-2025-52881	linux	runc		https://github.com/opencontainers/runc/security/advisories/GHSA-cgrx-mc8f-2prm

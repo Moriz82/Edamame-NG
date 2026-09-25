@@ -67,6 +67,14 @@ with tempfile.TemporaryDirectory(prefix="edamame-catalog-") as root:
     assert "indexed-review-only\tlinux" in linux
     assert "indexed-review-only\tlinux\tglibc" in run(
         ["bash", "edamame-ng.sh", "--cve", "CVE-2023-4911"], env).stdout
+    curated_ids = (
+        "CVE-2023-2640", "CVE-2023-32629", "CVE-2024-0132", "CVE-2024-21626",
+        "CVE-2025-31133", "CVE-2025-52565", "CVE-2025-52881",
+    )
+    assert len({line.split("\t")[0] for line in (ROOT / "catalog/curated-eop.tsv").read_text().splitlines()[1:]}) == 8
+    for identifier in curated_ids:
+        assert f"{identifier}\tindexed-review-only\tlinux\t" in run(
+            ["bash", "edamame-ng.sh", "--cve", identifier], env).stdout
     assert "unindexed" in run(["bash", "edamame-ng.sh", "--cve", "CVE-2099-99999"], env).stdout
     bundled = run(["bash", "edamame-ng.sh", "--poc", "CVE-2025-32463"], env).stdout
     assert "verified-bundle" in bundled and "exact-build-only" in bundled
@@ -82,6 +90,10 @@ with tempfile.TemporaryDirectory(prefix="edamame-catalog-") as root:
         assert "indexed-review-only\tlinux\tglibc" in run(
             [str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
              "-Cve", "CVE-2023-4911"], env).stdout
+        for identifier in curated_ids:
+            assert f"{identifier}\tindexed-review-only\tlinux\t" in run(
+                [str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
+                 "-Cve", identifier], env).stdout
         poc = run([str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
                    "-Poc", "CVE-2025-32463"], env).stdout
         assert "verified-bundle" in poc
