@@ -273,7 +273,18 @@ $havePrivescCheck = Get-ReleaseAsset 'itm4n/PrivescCheck' 'PrivescCheck.ps1' $pr
 
 $domainJoined = $false
 $sharpCollectedZip = $null
-try { $domainJoined = [bool](Get-CimInstance Win32_ComputerSystem).PartOfDomain } catch { Write-Warning 'Domain join status unavailable.' }
+try {
+    $domainJoined = [bool](Get-CimInstance Win32_ComputerSystem).PartOfDomain
+} catch {
+    # A standard user can query its computer domain even when WMI denies access.
+    try {
+        $domainJoined = [bool][System.DirectoryServices.ActiveDirectory.Domain]::GetComputerDomain()
+    } catch [System.DirectoryServices.ActiveDirectory.ActiveDirectoryObjectNotFoundException] {
+        $domainJoined = $false
+    } catch {
+        Write-Warning 'Domain join status unavailable.'
+    }
+}
 if ($domainJoined) {
     $sharpRecorded = $false
     $latestSharp = $null
