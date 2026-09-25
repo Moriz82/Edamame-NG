@@ -22,7 +22,7 @@ An additional approved Resume without `-NoShell` left PowerShell process 7240 al
 
 For a complete enumerator pass, a temporary Defender exclusion was limited to the disposable guest's new tool and run directories. Run `20260925T163316Z-EDAMAME-WS25-4692` used the verified WinPEAS executable (SHA-256 `e51bbd25a3c54668a5b249ffabbf37c6992a0a9b77f7de4164d468f0762cc2f1`), PrivescCheck, and the same SharpHound ZIP. All three tools were marked `checked` in `coverage.tsv`; the 30,919-byte SharpHound collection ZIP was saved. Alerts reported 1,273 WinPEAS and 121 PrivescCheck candidate lines before final output files appeared. Eleven CVE strings were indexed as review suggestions only. The already-SYSTEM recipe verified its token. The run completed in 3 minutes 22 seconds.
 
-The merged repository snapshot at commit `a8e076f` was transferred to the guest as a ZIP with SHA-256 `005c87d21d21895c77312a1de5e730e4350aaac0f36e3ad7de598a479e7c7466`. Its native Windows PowerShell 5.1 release, catalog, and weak-service tests all passed.
+The tested repository snapshot was transferred to the guest as a ZIP with SHA-256 `005c87d21d21895c77312a1de5e730e4350aaac0f36e3ad7de598a479e7c7466`. Its native Windows PowerShell 5.1 release, catalog, and weak-service tests all passed.
 
 ## Limits and cleanup
 
