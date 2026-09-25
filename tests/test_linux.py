@@ -34,6 +34,7 @@ with tempfile.TemporaryDirectory(prefix="edamame-test-") as temp:
     marker = base / "enumerations"
     write(fake / "uname", "#!/bin/sh\necho Linux\n")
     write(fake / "hostname", "#!/bin/sh\necho fixture-host\n")
+    write(fake / "id", "#!/bin/sh\necho 0\n")
     write(fake / "timeout", "#!/bin/sh\nshift\ncase \"$*\" in *linpeas.sh*) if [ -n \"${EDAMAME_TEST_TIMEOUT_FAIL:-}\" ]; then echo 'CVE-2026-99999 partial'; exit 124; fi;; esac\nexec \"$@\"\n")
     write(fake / "sudo", "#!/bin/sh\n[ -z \"${EDAMAME_TEST_NO_SUDO:-}\" ] || exit 1\nif [ \"$1\" = -n ] && [ \"$2\" = /bin/bash ]; then exit 0; fi\nexit 1\n")
     write(fake / "docker", "#!/bin/sh\nexit 1\n")

