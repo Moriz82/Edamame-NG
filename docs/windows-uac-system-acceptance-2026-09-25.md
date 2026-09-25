@@ -16,7 +16,7 @@ Disposable Windows Server 2022 VM 1730 was cloned from stopped lab source guest 
 
 The targeted UAC runs intentionally lacked WinPEAS, PrivescCheck, and SharpHound assets. Those rows stayed unavailable or unsupported; this test does not count them as completed enumeration. Earlier disposable Windows matrix runs cover those enumerators. The accepted SYSTEM routes require an administrator token or membership plus UAC consent. A standard-user to SYSTEM recipe, automatic credential validation, and broadly portable Windows CVE exploitation remain unsupported.
 
-The temporary `PSEXESVC` service and the exploratory scheduled task were absent after testing. The successful SYSTEM run directory granted explicit full control only to the test account and SYSTEM. VM 1730, its ZFS disks and config, bridge `lab-net-08`, the temporary HTTP stage, and local staging files were removed. non-test guests remained running, source guests remained stopped, and `labpool` was healthy.
+The temporary `PSEXESVC` service and the exploratory scheduled task were absent after testing. The successful SYSTEM run directory granted explicit full control only to the test account and SYSTEM. VM 1730, its ZFS disks and config, bridge `lab-net-08`, the temporary HTTP stage, and local staging files were removed. Non-test guests remained running, source guests remained stopped, and `labpool` was healthy.
 
 ## Hardening retest on a fresh isolated clone
 
@@ -36,4 +36,4 @@ The reviewed route was retested on a new full clone of stopped source guest, aga
 
 This acceptance is specific to the Windows Server 2022 console guest. Client Windows, RDP and multiple sessions, interrupted service cleanup, and standard-user-to-SYSTEM behavior still need independent proof. Other checklist areas and credential validation remain explicitly unsupported where no reviewed recipe exists.
 
-After the retest, VM 1730 was stopped, destroyed, and purged. Readback found no VM 1730 configuration or ZFS volume, `lab-net-08` was absent, the bridge-local HTTP service was inactive, and its staging directory was removed. non-test guests were still running, source guests were still stopped, and `zpool status -x` reported all pools healthy.
+After the retest, VM 1730 was stopped, destroyed, and purged. Readback found no VM 1730 configuration or ZFS volume, `lab-net-08` was absent, the bridge-local HTTP service was inactive, and its staging directory was removed. Non-test guests were still running, source guests were still stopped, and `zpool status -x` reported all pools healthy.

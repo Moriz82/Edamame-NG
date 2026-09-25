@@ -14,6 +14,9 @@ TOOL_DIR=''
 MODE='auto'
 RESUME_ID=''
 NO_SHELL=0
+VERBOSE=0
+OFFLINE=0
+FINISH_BG_ENUM=0
 CATALOG_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/catalog"
 CVE_QUERY=''
 POC_QUERY=0
@@ -25,7 +28,8 @@ CVE_POC_SHA='9826979c7a3cb1ca582862768d74245806051db5601c7b6a7e13bde93b8052d7'
 usage() {
   cat <<'EOF'
 Usage: edamame-ng.sh [--scan | --resume [RUN_ID]] [--output-dir DIR]
-                      [--tool-dir DIR] [--catalog-dir DIR] [--no-shell]
+                      [--tool-dir DIR] [--catalog-dir DIR] [--offline]
+                      [--finish-bg-enum] [--verbose] [--no-shell]
                       [--enable-cve-2025-32463-lab]
        edamame-ng.sh --cve CVE-YYYY-NNNN [--catalog-dir DIR]
        edamame-ng.sh --poc CVE-YYYY-NNNN [--catalog-dir DIR]
@@ -45,6 +49,9 @@ while (($#)); do
     --poc) (($# >= 2)) || { usage >&2; exit 2; }; CVE_QUERY=$2; POC_QUERY=1; shift 2 ;;
     --enable-cve-2025-32463-lab) LAB_CVE_ENABLED=1; shift ;;
     --no-shell) NO_SHELL=1; shift ;;
+    --offline) OFFLINE=1; shift ;;
+    --finish-bg-enum) FINISH_BG_ENUM=1; shift ;;
+    -v|--verbose) VERBOSE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
   esac
@@ -52,6 +59,25 @@ done
 CVE_POC="$CATALOG_DIR/pocs/CVE-2025-32463/sudo-chwoot.sh"
 CVE_CURATED="$CATALOG_DIR/curated-eop.tsv"
 [[ -f $CVE_CURATED ]] || CVE_CURATED=/dev/null
+
+cve_lookup() {
+  local id=$1 platform=$2 row state year
+  row=$(awk -F '\t' -v id="$id" -v platform="$platform" 'FNR>1 && $1==id {
+    status=($2==platform || platform=="any" ? "indexed-review-only" : "platform-mismatch")
+    print $1 "\t" status "\t" $2 "\t" $3 "\t" $4 "\t" $5; exit}' \
+    "$CATALOG_DIR/local-eop.tsv" "$CVE_CURATED")
+  if [[ -n $row ]]; then
+    printf '%s\n' "$row"
+    return
+  fi
+  year=${id:4:4}
+  state=''
+  if [[ -f $CATALOG_DIR/cve-ids/$year.tsv ]]; then
+    state=$(awk -F '\t' -v id="$id" 'FNR>1 && $1==id {print $2; exit}' "$CATALOG_DIR/cve-ids/$year.tsv")
+  fi
+  [[ -n $state ]] && state="${state}-general" || state=unindexed
+  printf '%s\t%s\t\t\t\thttps://www.cve.org/CVERecord?id=%s\n' "$id" "$state" "$id"
+}
 
 sha256_file() {
   local binary line digest
@@ -111,10 +137,19 @@ if [[ -n $CVE_QUERY ]]; then
   else
     [[ -f $CATALOG_DIR/local-eop.tsv ]] || { printf 'Offline catalog unavailable.\n' >&2; exit 2; }
     printf 'cve\tstatus\tplatform\tproduct\tkev_date\treference\n'
-    awk -F '\t' -v id="$CVE_QUERY" 'FNR>1 && $1==id {print $1 "\tindexed-review-only\t" $2 "\t" $3 "\t" $4 "\t" $5; found=1; exit} END {if (!found) print id "\tunindexed\t\t\t\thttps://www.cve.org/CVERecord?id=" id}' "$CATALOG_DIR/local-eop.tsv" "$CVE_CURATED"
+    cve_lookup "$CVE_QUERY" any
   fi
   exit 0
 fi
+
+cat <<'EOF'
+   _____    _                                   _   _  _____
+  | ____|__| | __ _ _ __ ___   __ _ _ __ ___   | \ | |/ ____|
+  |  _| / _` |/ _` | '_ ` _ \ / _` | '_ ` _ \  |  \| | |  __
+  | |__| (_| | (_| | | | | | | (_| | | | | | | | |\  | |__| |
+  |_____\__,_|\__,_|_| |_| |_|\__,_|_| |_| |_| |_| \_|\_____|
+                      Edamame-NG  /  Linux
+EOF
 
 safe_name() { [[ $1 =~ ^[A-Za-z0-9._+-]+$ && $1 != . && $1 != .. ]]; }
 host_name=$(hostname -s 2>/dev/null || hostname)
@@ -149,6 +184,10 @@ if [[ $MODE == auto ]]; then
   else
     MODE=scan
   fi
+fi
+
+if ((VERBOSE)) && [[ $MODE == scan ]]; then
+  printf '[WARN] Verbose displays raw enumerator output, including possible credentials, on this console.\n' >&2
 fi
 
 success_file=''
@@ -214,7 +253,7 @@ asset_from_release() {
       fi
     fi
     printf '[WARN] Local %s is missing or its checksum failed.\n' "$asset" >&2
-  else
+  elif (( ! OFFLINE )); then
     url=$(curl -fsSLI --connect-timeout 5 --max-time 20 -o /dev/null -w '%{url_effective}' "https://github.com/$repo/releases/latest" 2>/dev/null || true)
     tag=${url##*/}
     if safe_name "$tag" && [[ $url == "https://github.com/$repo/releases/tag/"* ]]; then
@@ -249,6 +288,8 @@ asset_from_release() {
       fi
     fi
     printf '[WARN] Current %s unavailable; checking verified cache.\n' "$asset" >&2
+  else
+    printf '[OFFLINE] Checking verified cache for %s.\n' "$asset"
   fi
   if [[ -f $cached && -f $cached.sha256 ]]; then
     expected=$(awk 'NR==1 {print $1}' "$cached.sha256" | tr '[:upper:]' '[:lower:]')
@@ -349,6 +390,8 @@ fi
 
 if [[ -n $TOOL_DIR ]]; then
   printf '[ENUM] Loading verified local assets.\n'
+elif ((OFFLINE)); then
+  printf '[OFFLINE] Using verified cached assets; release downloads are disabled.\n'
 else
   printf '[ENUM] Fetching official current release assets.\n'
 fi
@@ -359,36 +402,44 @@ linpeas_complete=0; lse_complete=0
 asset_from_release peass-ng/PEASS-ng linpeas.sh "$linpeas" && have_linpeas=1
 asset_from_release diego-treitos/linux-smart-enumeration lse.sh "$lse" && have_lse=1
 
+linpeas_pid=''; lse_pid=''
 if ((have_linpeas)); then
   printf '[ENUM] LinPEAS\n'
-  if timeout 600 bash "$linpeas" > "$RUN_DIR/.capture/linpeas-output.txt" 2>&1; then
-    printf 'linpeas\tchecked\n' >> "$RUN_DIR/coverage.tsv"
-    linpeas_complete=1
-  else
-    printf 'linpeas\tpartial\n' >> "$RUN_DIR/coverage.tsv"
-  fi
-else
-  printf 'linpeas\tunavailable\n' >> "$RUN_DIR/coverage.tsv"
+  timeout 600 bash "$linpeas" > "$RUN_DIR/.capture/linpeas-output.txt" 2>&1 &
+  linpeas_pid=$!
 fi
 if ((have_lse)); then
   printf '[ENUM] LSE\n'
-  if timeout 600 bash "$lse" -i -l2 -c > "$RUN_DIR/.capture/lse-output.txt" 2>&1; then
-    printf 'lse\tchecked\n' >> "$RUN_DIR/coverage.tsv"
-    lse_complete=1
-  else
-    printf 'lse\tpartial\n' >> "$RUN_DIR/coverage.tsv"
-  fi
-else
-  printf 'lse\tunavailable\n' >> "$RUN_DIR/coverage.tsv"
+  timeout 600 bash "$lse" -i -l2 -c > "$RUN_DIR/.capture/lse-output.txt" 2>&1 &
+  lse_pid=$!
 fi
 
-for label in linpeas lse; do
-  output="$RUN_DIR/.capture/$label-output.txt"
-  if [[ -f $output ]]; then
-    count=$(grep -aEic 'writ(e|able)|password|credential|suid|cap_setuid|sudo|CVE-' "$output" || true)
-    record_finding "$label-screening" "$count candidate lines in raw output; values withheld from console"
+# Only new bytes are screened. A 64-byte overlap catches a CVE split across
+# writes without rereading a potentially large PEAS capture on every poll.
+cve_tmp="$RUN_DIR/.capture/cve-candidates.txt"
+: > "$cve_tmp"
+linpeas_offset=0; lse_offset=0; last_cve_count=0
+screen_live_output() {
+  local label file offset size start delta count
+  for label in linpeas lse; do
+    file="$RUN_DIR/.capture/$label-output.txt"
+    [[ -f $file ]] || continue
+    if [[ $label == linpeas ]]; then offset=$linpeas_offset; else offset=$lse_offset; fi
+    size=$(wc -c < "$file" | tr -d ' ')
+    ((size > offset)) || continue
+    start=$((offset > 64 ? offset - 63 : 1))
+    delta="$RUN_DIR/.capture/$label.delta"
+    tail -c +"$start" "$file" > "$delta"
+    if ((VERBOSE)); then tail -c +$((offset-start+2)) "$delta"; fi
+    grep -aoE 'CVE-[0-9]{4}-[0-9]{4,}' "$delta" >> "$cve_tmp" || true
+    if [[ $label == linpeas ]]; then linpeas_offset=$size; else lse_offset=$size; fi
+  done
+  count=$(sort -u "$cve_tmp" | wc -l | tr -d ' ')
+  if ((count > last_cve_count)); then
+    record_finding cve-candidates "$count suggested so far; review package/build status"
+    last_cve_count=$count
   fi
-done
+}
 
 printf '[ENUM] Verifying local escalation paths.\n'
 if command -v sudo >/dev/null 2>&1; then
@@ -400,15 +451,8 @@ if command -v getcap >/dev/null 2>&1; then
 fi
 find /usr/bin /bin -maxdepth 1 -perm -4000 -type f 2>/dev/null > "$RUN_DIR/.capture/suid-files.txt" || true
 
-cve_tmp="$RUN_DIR/.capture/cve-candidates.txt"
-for file in "$RUN_DIR/.capture/linpeas-output.txt" "$RUN_DIR/.capture/lse-output.txt"; do
-  [[ -f $file ]] && grep -aoE 'CVE-[0-9]{4}-[0-9]{4,}' "$file" || true
-done | sort -u > "$cve_tmp"
-if [[ -s $cve_tmp ]]; then
-  record_finding cve-candidates "$(wc -l < "$cve_tmp" | tr -d ' ') suggested; review package/build status"
-fi
-
 selected=''
+shell_opened=0
 candidates=(already-root sudo-shell suid-bash suid-find python-cap-setuid docker-host-root)
 if ((LAB_CVE_ENABLED)); then candidates+=(cve-2025-32463-lab); fi
 for candidate in "${candidates[@]}"; do
@@ -420,6 +464,52 @@ for candidate in "${candidates[@]}"; do
   fi
   record_attempt "$candidate" prerequisite-not-met
 done
+if [[ -n $selected && $NO_SHELL == 0 ]]; then
+  if ((FINISH_BG_ENUM)); then
+    printf '[ENUM] Enumerators continue while the shell is open. Final files are saved when it exits.\n'
+    early_evidence=verified-local-proof
+    if [[ $selected == cve-2025-32463-lab ]]; then
+      early_evidence="uid0-probe,sudo-sha256:$CVE_SUDO_SHA,poc-sha256:$CVE_POC_SHA"
+    fi
+    printf '%s\t%s\t%s\n' "$host_name" "$selected" "$early_evidence" > "$RUN_DIR/success.tsv"
+    open_shell "$selected"
+    shell_opened=1
+  else
+    [[ -n $linpeas_pid ]] && kill "$linpeas_pid" 2>/dev/null || true
+    [[ -n $lse_pid ]] && kill "$lse_pid" 2>/dev/null || true
+    printf '[ENUM] Stopping remaining enumerators after verified proof.\n'
+  fi
+fi
+
+while :; do
+  screen_live_output
+  active=0
+  [[ -n $linpeas_pid ]] && kill -0 "$linpeas_pid" 2>/dev/null && active=1
+  [[ -n $lse_pid ]] && kill -0 "$lse_pid" 2>/dev/null && active=1
+  ((active)) || break
+  sleep 0.2
+done
+screen_live_output
+if [[ -n $linpeas_pid ]]; then
+  if wait "$linpeas_pid"; then linpeas_complete=1; fi
+  printf 'linpeas\t%s\n' "$( ((linpeas_complete)) && printf checked || printf partial )" >> "$RUN_DIR/coverage.tsv"
+else
+  printf 'linpeas\tunavailable\n' >> "$RUN_DIR/coverage.tsv"
+fi
+if [[ -n $lse_pid ]]; then
+  if wait "$lse_pid"; then lse_complete=1; fi
+  printf 'lse\t%s\n' "$( ((lse_complete)) && printf checked || printf partial )" >> "$RUN_DIR/coverage.tsv"
+else
+  printf 'lse\tunavailable\n' >> "$RUN_DIR/coverage.tsv"
+fi
+for label in linpeas lse; do
+  output="$RUN_DIR/.capture/$label-output.txt"
+  if [[ -f $output ]]; then
+    count=$(grep -aEic 'writ(e|able)|password|credential|suid|cap_setuid|sudo|CVE-' "$output" || true)
+    record_finding "$label-screening" "$count candidate lines in raw output; values withheld from console"
+  fi
+done
+sort -u "$cve_tmp" -o "$cve_tmp"
 if [[ $selected == cve-2025-32463-lab ]]; then
   printf 'CVE-2025-32463 tested lab build\tchecked\texact sudo and PoC digests plus UID 0 probe\n' >> "$RUN_DIR/coverage.tsv"
 elif (( ! LAB_CVE_ENABLED )); then
@@ -478,9 +568,9 @@ while IFS= read -r cve; do
 done < "$cve_tmp" > "$RUN_DIR/cve-candidates.tsv"
 printf 'cve\tstatus\tplatform\tproduct\tkev_date\treference\n' > "$RUN_DIR/cve-index.tsv"
 if [[ -f $CATALOG_DIR/local-eop.tsv ]]; then
-  awk -F '\t' 'FILENAME==ARGV[1] || FILENAME==ARGV[2] {if (FNR>1 && !($1 in record)) {record[$1]=$0; platform[$1]=$2}; next}
-    NF {if ($1 in record) {split(record[$1], fields, "\t"); status=(platform[$1]=="linux" ? "indexed-review-only" : "platform-mismatch"); print $1 "\t" status "\t" fields[2] "\t" fields[3] "\t" fields[4] "\t" fields[5]}
-    else print $1 "\tunindexed\t\t\t\thttps://www.cve.org/CVERecord?id=" $1}' "$CATALOG_DIR/local-eop.tsv" "$CVE_CURATED" "$cve_tmp" >> "$RUN_DIR/cve-index.tsv"
+  while IFS= read -r cve; do
+    [[ -n $cve ]] && cve_lookup "$cve" linux >> "$RUN_DIR/cve-index.tsv"
+  done < "$cve_tmp"
 else
   printf '[WARN] Offline CVE catalog unavailable; retaining CVE.org links.\n' >&2
   awk '{print $1 "\tunindexed\t\t\t\thttps://www.cve.org/CVERecord?id=" $1}' "$cve_tmp" >> "$RUN_DIR/cve-index.tsv"
@@ -493,7 +583,7 @@ if [[ -n $selected ]]; then
     evidence="uid0-probe,sudo-sha256:$CVE_SUDO_SHA,poc-sha256:$CVE_POC_SHA"
   fi
   printf '%s\t%s\t%s\n' "$host_name" "$selected" "$evidence" > "$RUN_DIR/success.tsv"
-  open_shell "$selected"
+  if (( ! shell_opened )); then open_shell "$selected"; fi
   exit 0
 fi
 printf '[RESULT] No supported local escalation recipe verified. See %s\n' "$RUN_DIR"

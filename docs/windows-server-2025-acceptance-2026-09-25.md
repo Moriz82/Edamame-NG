@@ -1,0 +1,31 @@
+# Windows Server 2025 acceptance — 2026-09-25
+
+Disposable VM 1802 on an isolated Proxmox host ran Windows Server 2025 Datacenter Evaluation, build 26100, with Windows PowerShell 5.1.26100.7462. The ISO came from [Microsoft's Evaluation Center](https://www.microsoft.com/en-us/evalcenter/download-windows-server-2025) through its official download alias. Its locally calculated SHA-256 was `7b052573ba7894c9924e3e87ba732ccd354d18cb75a883efa9b900ea125bfd51`; no independent published digest for this exact evaluation ISO was verified. The VM used an isolated `lab-net-10` bridge with no uplink and a temporary address. No assessment target or production guest was tested. Credentials and raw enumerator output are excluded from this record.
+
+The transferred tool bundle matched SHA-256 `c78832f917a63449d14ac876f11066c6dfee41ca26149e361157f445d290ab4c`. Native PowerShell 5.1 runs of `tests/test_windows_catalog.ps1` and `tests/test_release.ps1` passed.
+
+## Workgroup and standard-user route
+
+An ordinary local account logged into RDP session 2. The task token was not an Administrator. Run `20260925T160338Z-EDAMAME-WS25-2168` used verified offline assets and a 60-second per-tool timeout. Defender had removed the WinPEAS executable from the staging directory; the batch fallback and PrivescCheck each retained partial output on timeout. The console alerted on 47 and 115 candidate lines, with values withheld, before saving `winpeas-output.txt` and `privesccheck-output.txt`. It selected no recipe and saved no success file. The run directory ACL gave full control only to that account and SYSTEM.
+
+The fixed `EdamameWeakSvc` fixture was created for that account's SID. The [separate weak-service branch](windows-weak-service-acceptance-2026-09-25.md) was transferred as a ZIP with SHA-256 `fadbded2cef7b927cabc5d1712ebc2667786edc6a37ce7995f451ded094b9711`. Its native PowerShell test passed under SYSTEM and under the ordinary account with `-ExpectedNotSystem`. Run `20260925T160722Z-EDAMAME-WS25-5908`, launched from the account's RDP session with explicit service-change approval and `-NoShell`, independently verified a `S-1-5-18` pipe client. Explicit Resume skipped enumeration, requested the service-change approval again, and repeated the SYSTEM proof. `success.json` held only the recipe ID, fixture ID, proof SID, and restoration flag. The service path matched the original after Scan and Resume. Exact fixture removal left no marker; `sc query EdamameWeakSvc` returned 1060.
+
+## Domain-controller route
+
+The same disposable VM was promoted to the new isolated `lab-c.invalid` forest. After reboot it reported `DomainRole=5`, and NTDS and DNS were running. [SharpHound v2.16.0](https://github.com/SpecterOps/SharpHound/releases/tag/v2.16.0) was fetched from the publisher and its ZIP matched the publisher's SHA-256 `41cfd1a6ac4948beac7c96972416b96b9d6c26b780929ebdfb817051d87f0d64`.
+
+Run `20260925T162303Z-EDAMAME-WS25-2936` executed as local SYSTEM. SharpHound Default collection completed and saved a 30,762-byte `sharphound.zip` with seven readable entries; `coverage.tsv` marked SharpHound, Active Directory, and BloodHound checked. WinPEAS batch and PrivescCheck retained partial output at the 180-second limit. Alerts reported 734 and 97 candidate lines before the final output names appeared. The already-SYSTEM recipe saved a token proof. The run ACL contained only SYSTEM.
+
+A domain Administrator in RDP session 2 ran `20260925T163041Z-EDAMAME-WS25-1104` with a verified Microsoft PsExec64.exe (SHA-256 `edfae1a69522f87b12c6dac3225d930e4848832e3c551ee1e7d31736bf4525ef`), explicit service approval, and `-NoShell`. The `admin-system` recipe verified a SYSTEM token. Explicit Resume skipped enumeration, reapproved the service action, and verified SYSTEM again. The success file contained the recipe ID and evidence label only. Afterward, `PSEXESVC` returned service error 1060; its executable and service registry key were absent.
+
+An additional approved Resume without `-NoShell` left PowerShell process 7240 alive in the Administrator's RDP session 2. An independent process-owner query returned SID `S-1-5-18` for that process, and `PSEXESVC` was absent while it remained open. The shell remained interactive: typing `whoami` returned `nt authority\system` in the RDP console. [Server 2025 SYSTEM shell screenshot](windows-server-2025-system-shell-2026-09-25.png).
+
+For a complete enumerator pass, a temporary Defender exclusion was limited to the disposable guest's new tool and run directories. Run `20260925T163316Z-EDAMAME-WS25-4692` used the verified WinPEAS executable (SHA-256 `e51bbd25a3c54668a5b249ffabbf37c6992a0a9b77f7de4164d468f0762cc2f1`), PrivescCheck, and the same SharpHound ZIP. All three tools were marked `checked` in `coverage.tsv`; the 30,919-byte SharpHound collection ZIP was saved. Alerts reported 1,273 WinPEAS and 121 PrivescCheck candidate lines before final output files appeared. Eleven CVE strings were indexed as review suggestions only. The already-SYSTEM recipe verified its token. The run completed in 3 minutes 22 seconds.
+
+The tested repository snapshot was transferred to the guest as a ZIP with SHA-256 `005c87d21d21895c77312a1de5e730e4350aaac0f36e3ad7de598a479e7c7466`. Its native Windows PowerShell 5.1 release, catalog, and weak-service tests all passed.
+
+## Limits and cleanup
+
+The domain had one disposable DC, so SharpHound collection does not prove behavior across a multi-host forest. The weak-service route applies only to its exact fixture. General standard-user service escalation, credential validation, and Windows CVE execution remain unsupported. Defender-blocked and timed-out enumerator runs are recorded as partial rather than full checklist coverage.
+
+Cleanup completed. The interactive SYSTEM shell exited, and the guest-only Defender exclusions were removed. VM 1802 was shut down and destroyed; readback found no VM configuration or ZFS volume. The two evaluation/answer ISOs, staging directories, HTTP transfer process, and isolated `lab-net-10` bridge were absent. Local temporary password files were removed. Non-test guests and other test guests were running, source guests were stopped, and `zpool status -x` reported all pools healthy.
