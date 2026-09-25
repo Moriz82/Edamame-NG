@@ -12,6 +12,8 @@ param(
     [string]$Poc,
     [ValidateRange(15, 3600)][int]$ToolTimeoutSeconds = 300,
     [switch]$ApproveSystemService,
+    [switch]$EnableWeakServiceLab,
+    [switch]$ApproveServiceChange,
     [switch]$NoShell
 )
 
@@ -20,6 +22,7 @@ if ([string]::IsNullOrWhiteSpace($CatalogDir)) { $CatalogDir = Join-Path $PSScri
 $hostName = $env:COMPUTERNAME
 $cacheBase = Join-Path $env:LOCALAPPDATA 'Edamame-NG\cache'
 $runDir = $null
+$weakServiceEvidence = $null
 
 function Get-CatalogEntries([string]$Path) {
     $rows = @()
@@ -97,6 +100,8 @@ if ($Cve) {
     return
 }
 
+if ($EnableWeakServiceLab) { . (Join-Path $PSScriptRoot 'lib\WeakServiceLab.ps1') }
+
 function Set-PrivateDirectory([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) {
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
@@ -137,7 +142,7 @@ function Get-LatestSuccess {
             if (Test-Path -LiteralPath $candidate) {
                 try {
                     $saved = Get-Content -LiteralPath $candidate -Raw | ConvertFrom-Json
-                    if ($saved.host -eq $hostName -and $saved.recipe -in @('already-system', 'already-admin', 'uac-admin', 'admin-system', 'uac-admin-system')) {
+                    if ($saved.host -eq $hostName -and $saved.recipe -in @('already-system', 'already-admin', 'uac-admin', 'admin-system', 'uac-admin-system', 'weak-service-lab')) {
                         return $candidate
                     }
                 } catch { }
@@ -445,6 +450,10 @@ function Invoke-Recipe([string]$Recipe) {
             return $true
         }
         'admin-system' { return (Invoke-SystemViaPsExec) }
+        'weak-service-lab' {
+            if (-not $EnableWeakServiceLab) { return $false }
+            return (Invoke-WeakServiceLabRecipe $expectedWeakFixtureId)
+        }
         'uac-admin-system' {
             if (-not (Test-AdminMembership)) { return $false }
             $sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
@@ -549,8 +558,31 @@ if ($Resume) {
     $capture = Join-Path $runDir '.capture'
     Set-PrivateDirectory $capture
     $saved = Get-Content -LiteralPath $prior -Raw | ConvertFrom-Json
-    if ($saved.host -ne $hostName -or $saved.recipe -notin @('already-system', 'already-admin', 'uac-admin', 'admin-system', 'uac-admin-system')) {
+    if ($saved.host -ne $hostName -or $saved.recipe -notin @('already-system', 'already-admin', 'uac-admin', 'admin-system', 'uac-admin-system', 'weak-service-lab')) {
         throw 'Saved run has an invalid host or recipe'
+    }
+    if ($saved.recipe -eq 'weak-service-lab') {
+        if (-not $EnableWeakServiceLab) {
+            Write-Attempt $saved.recipe 'resume-optin-missing'
+            throw 'Weak-service lab recipe requires fresh opt-in'
+        }
+        $expectedWeakFixtureId = [string]$saved.evidence.fixture_id
+        if ($expectedWeakFixtureId -cnotmatch '^[0-9a-f]{32}$' -or
+            $saved.evidence.service -cne 'EdamameWeakSvc' -or
+            $saved.evidence.proof_sid -cne 'S-1-5-18' -or
+            $saved.evidence.configuration_restored -cne $true) {
+            throw 'Saved weak-service evidence is invalid'
+        }
+        $currentWeakState = Get-WeakServiceLabState
+        if (-not $currentWeakState -or $currentWeakState.FixtureId -cne $expectedWeakFixtureId) {
+            Write-Attempt $saved.recipe 'resume-prerequisite-failed'
+            throw 'Saved weak-service fixture no longer matches'
+        }
+        if (-not (Confirm-WeakServiceChange)) {
+            Write-Attempt $saved.recipe 'resume-service-change-approval-declined'
+            throw 'Weak-service recipe requires fresh approval'
+        }
+        Write-Attempt $saved.recipe 'resume-service-change-approved'
     }
     if ($saved.recipe -in @('admin-system', 'uac-admin-system')) {
         if (-not (Confirm-SystemService)) {
@@ -753,6 +785,18 @@ try {
     }
 } catch { Write-Warning 'Service path check failed.' }
 
+$weakLabState = $null
+if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Edamame-NG\Lab\WeakService') {
+    if ($EnableWeakServiceLab -and -not (Test-AdminMembership) -and -not (Test-AdminIdentity) -and -not (Test-SystemIdentity)) {
+        $weakLabState = Get-WeakServiceLabState
+    }
+    if ($weakLabState) {
+        Write-Finding 'weak-service-lab' 'Exact fixture, stopped LocalSystem service, original path, and effective change/start rights verified'
+    } else {
+        Write-Finding 'weak-service-lab' 'Fixture marker present; current token or fixture did not pass the gated recipe prerequisites'
+    }
+}
+
 $suggestedCves = @()
 foreach ($file in @('winpeas-output.txt', 'privesccheck-output.txt')) {
     $path = Join-Path $capture $file
@@ -774,6 +818,9 @@ if (Test-SystemIdentity) {
 } elseif (Test-AdminMembership) {
     $recipe = 'uac-admin'
     Write-Finding 'local-elevation' 'Administrator membership detected; UAC elevation available'
+} elseif ($weakLabState) {
+    $recipe = 'weak-service-lab'
+    Write-Finding 'local-elevation' 'Standard-user SYSTEM route verified on the exact disposable weak-service fixture'
 }
 $enumStatus = if ($winpeasOk -and $privescComplete) { 'checked' } else { 'unsupported' }
 foreach ($area in @(
@@ -795,11 +842,12 @@ foreach ($area in @('Active Directory', 'Initial Enumeration', 'BloodHound')) {
 foreach ($area in @(
     'Enumerating DACLs with BloodyAD', 'Credential Hunting', 'POISONING Attacks',
     'EXCHANGE', 'SCCM', 'ONCE YOU GET DA', 'Things to check for', 'Other Attacks',
-    'GPOs, Domain Auditing', 'Credential validation', 'Local CVE exploitation',
-    'Standard-user SYSTEM recipe')) {
+    'GPOs, Domain Auditing', 'Credential validation', 'Local CVE exploitation')) {
     $status = if (-not $domainJoined -and $area -notin @('Local CVE exploitation', 'Standard-user SYSTEM recipe')) { 'inapplicable' } else { 'unsupported' }
     Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "$area`t$status`tno reviewed automatic recipe"
 }
+$weakCoverage = if ($weakLabState) { 'checked' } else { 'unsupported' }
+Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "Standard-user SYSTEM recipe`t$weakCoverage`texact EdamameWeakSvc fixture only"
 
 # Alerts above precede these final output filenames.
 foreach ($name in @('winpeas-output.txt', 'winpeas-binary-partial.txt', 'privesccheck-output.txt', 'sharphound-output.txt')) {
@@ -819,6 +867,16 @@ Write-CveIndex $CatalogDir $suggestedCves (Join-Path $runDir 'cve-index.tsv')
 Write-Host '[SAVED] findings.tsv, coverage.tsv, attempts.tsv, tools.tsv'
 
 if ($recipe) {
+    if ($recipe -eq 'weak-service-lab') {
+        if (-not (Confirm-WeakServiceChange)) {
+            Write-Attempt $recipe 'service-change-approval-declined'
+            $recipe = $null
+        } else {
+            Write-Attempt $recipe 'service-change-approved'
+        }
+    }
+}
+if ($recipe) {
     if ($recipe -in @('already-admin', 'uac-admin')) {
         if (Confirm-SystemService) {
             Write-Attempt $recipe 'service-approved'
@@ -832,7 +890,8 @@ if ($recipe) {
         }
     }
     if (Invoke-Recipe $recipe) {
-        [pscustomobject]@{ host = $hostName; recipe = $recipe; evidence = 'verified-local-proof' } |
+        $evidence = if ($recipe -eq 'weak-service-lab') { $weakServiceEvidence } else { 'verified-local-proof' }
+        [pscustomobject]@{ host = $hostName; recipe = $recipe; evidence = $evidence } |
             ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $runDir 'success.json') -Encoding UTF8
         Write-Attempt $recipe 'proof-success'
         exit 0
