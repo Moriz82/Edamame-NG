@@ -272,7 +272,7 @@ fi
 for label in linpeas lse; do
   output="$RUN_DIR/.capture/$label-output.txt"
   if [[ -f $output ]]; then
-    count=$(grep -Eic 'writ(e|able)|password|credential|suid|cap_setuid|sudo|CVE-' "$output" || true)
+    count=$(grep -aEic 'writ(e|able)|password|credential|suid|cap_setuid|sudo|CVE-' "$output" || true)
     record_finding "$label-screening" "$count candidate lines in raw output; values withheld from console"
   fi
 done
@@ -289,7 +289,7 @@ find /usr/bin /bin -maxdepth 1 -perm -4000 -type f 2>/dev/null > "$RUN_DIR/.capt
 
 cve_tmp="$RUN_DIR/.capture/cve-candidates.txt"
 for file in "$RUN_DIR/.capture/linpeas-output.txt" "$RUN_DIR/.capture/lse-output.txt"; do
-  [[ -f $file ]] && grep -oE 'CVE-[0-9]{4}-[0-9]{4,}' "$file" || true
+  [[ -f $file ]] && grep -aoE 'CVE-[0-9]{4}-[0-9]{4,}' "$file" || true
 done | sort -u > "$cve_tmp"
 if [[ -s $cve_tmp ]]; then
   record_finding cve-candidates "$(wc -l < "$cve_tmp" | tr -d ' ') suggested; review package/build status"

@@ -272,6 +272,7 @@ $haveBat = Get-ReleaseAsset 'peass-ng/PEASS-ng' 'winPEAS.bat' $winpeasBat
 $havePrivescCheck = Get-ReleaseAsset 'itm4n/PrivescCheck' 'PrivescCheck.ps1' $privescCheck
 
 $domainJoined = $false
+$sharpCollectedZip = $null
 try { $domainJoined = [bool](Get-CimInstance Win32_ComputerSystem).PartOfDomain } catch { Write-Warning 'Domain join status unavailable.' }
 if ($domainJoined) {
     $sharpRecorded = $false
@@ -303,9 +304,12 @@ if ($domainJoined) {
                 $sharpStatus = Invoke-CapturedProcess $sharpExe.FullName `
                     "--CollectionMethods Default --OutputDirectory `"$sharpOut`" --ZipFileName sharphound.zip" `
                     (Join-Path $capture 'sharphound-output.txt') $ToolTimeoutSeconds
-                $collected = Join-Path $sharpOut 'sharphound.zip'
-                if ($sharpStatus -eq 'checked' -and (Test-Path -LiteralPath $collected)) {
-                    Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "sharphound`tchecked"
+                # SharpHound prefixes ZipFileName with a timestamp.
+                $sharpCollectedZip = Get-ChildItem -LiteralPath $sharpOut -Filter '*sharphound.zip' -File |
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                if ($sharpCollectedZip) {
+                    $zipStatus = if ($sharpStatus -eq 'checked') { 'checked' } else { 'partial-zip' }
+                    Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "sharphound`t$zipStatus"
                     $sharpRecorded = $true
                 } else {
                     Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "sharphound`tpartial-no-zip"
@@ -436,7 +440,7 @@ foreach ($area in @(
 }
 Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "UAC BYPASS:`tunsupported`tUAC admin consent is the only current recipe"
 $domainStatus = if (-not $domainJoined) { 'inapplicable' }
-    elseif (Test-Path -LiteralPath (Join-Path $capture 'sharphound-data\sharphound.zip')) { 'checked' }
+    elseif ($sharpCollectedZip -and $sharpStatus -eq 'checked') { 'checked' }
     else { 'unsupported' }
 foreach ($area in @('Active Directory', 'Initial Enumeration', 'BloodHound')) {
     Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "$area`t$domainStatus`tSharpHound Default collection"
@@ -459,9 +463,8 @@ foreach ($name in @('winpeas-output.txt', 'winpeas-binary-partial.txt', 'privesc
         Write-Host "[SAVED] $name"
     }
 }
-$dataZip = Join-Path (Join-Path $capture 'sharphound-data') 'sharphound.zip'
-if (Test-Path -LiteralPath $dataZip) {
-    Move-Item -LiteralPath $dataZip -Destination (Join-Path $runDir 'sharphound.zip')
+if ($sharpCollectedZip -and (Test-Path -LiteralPath $sharpCollectedZip.FullName)) {
+    Move-Item -LiteralPath $sharpCollectedZip.FullName -Destination (Join-Path $runDir 'sharphound.zip')
     Write-Host '[SAVED] sharphound.zip'
 }
 $suggestedCves | ForEach-Object { "$_`thttps://www.cve.org/CVERecord?id=$_" } |

@@ -62,7 +62,8 @@ else:
         ("lse.sh", "writable test location\n"),
     ):
         asset = tools / name
-        write(asset, f"#!/bin/sh\nprintf '%s\\n' '{output.rstrip()}'\necho run >> '{marker}'\n")
+        binary_prefix = "printf '\\000'\n" if name == "linpeas.sh" else ""
+        write(asset, f"#!/bin/sh\n{binary_prefix}printf '%s\\n' '{output.rstrip()}'\necho run >> '{marker}'\n")
         (tools / (name + ".sha256")).write_text(hashlib.sha256(asset.read_bytes()).hexdigest() + "\n")
 
     env = dict(os.environ, HOME=str(home), XDG_CACHE_HOME=str(base / "cache"),
