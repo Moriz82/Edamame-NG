@@ -58,7 +58,7 @@ else:
     sys.exit(22)
 """)
     for name, output in (
-        ("linpeas.sh", "CVE-2026-12345\npassword=keep-private\n"),
+        ("linpeas.sh", "CVE-2026-12345\nCVE-2025-32463\npassword=keep-private\n"),
         ("lse.sh", "writable test location\n"),
     ):
         asset = tools / name
@@ -79,7 +79,13 @@ else:
     assert (run_dir / "lse-output.txt").is_file()
     assert "CVE-2026-12345\thttps://www.cve.org/CVERecord?id=CVE-2026-12345" in (
         run_dir / "cve-candidates.tsv").read_text()
+    index = (run_dir / "cve-index.tsv").read_text()
+    assert "CVE-2026-12345\tunindexed" in index
+    assert "CVE-2025-32463\tindexed-review-only\tlinux" in index
     assert "sudo-shell" in (run_dir / "success.tsv").read_text()
+    assert "CVE-2025-32463 tested lab build\tunsupported\texplicit lab opt-in not supplied" in (
+        run_dir / "coverage.tsv").read_text()
+    assert "cve-2025-32463-lab" not in (run_dir / "attempts.tsv").read_text()
     assert len(marker.read_text().splitlines()) == 2
     resumed = run(ROOT / "edamame-ng.sh", env, "--resume", "--no-shell",
                   "--output-dir", str(runs)).stdout
@@ -98,6 +104,14 @@ else:
     unknown = run(ROOT / "edamame-ng.sh", env, "--resume", run_dir.name,
                   "--output-dir", str(runs), "--no-shell", check=False)
     assert unknown.returncode == 2 and "Unknown saved recipe" in unknown.stderr
+    saved.write_text(original.replace("sudo-shell", "cve-2025-32463-lab"))
+    not_opted_in = run(ROOT / "edamame-ng.sh", env, "--resume", run_dir.name,
+                       "--output-dir", str(runs), "--no-shell", check=False)
+    assert not_opted_in.returncode == 2 and "requires --enable-cve-2025-32463-lab" in not_opted_in.stderr
+    not_fixture = run(ROOT / "edamame-ng.sh", env, "--resume", run_dir.name,
+                      "--output-dir", str(runs), "--no-shell",
+                      "--enable-cve-2025-32463-lab", check=False)
+    assert not_fixture.returncode == 1 and "no longer works" in not_fixture.stderr
     saved.write_text(original)
     invalid = run(ROOT / "edamame-ng.sh", env, "--resume", "..",
                   "--output-dir", str(runs), "--no-shell", check=False)
@@ -107,6 +121,13 @@ else:
                  "--output-dir", str(runs), "--no-shell", check=False)
     assert denied.returncode == 1 and "no longer works" in denied.stderr
     assert len(marker.read_text().splitlines()) == 2
+    lab_runs = base / "lab-runs"
+    run(ROOT / "edamame-ng.sh", denied_env, "--scan", "--no-shell",
+        "--enable-cve-2025-32463-lab", "--output-dir", str(lab_runs),
+        "--tool-dir", str(tools))
+    lab_dir = next(lab_runs.iterdir())
+    assert "cve-2025-32463-lab\tprerequisite-not-met" in (
+        lab_dir / "attempts.tsv").read_text()
     online_runs = base / "online-runs"
     run(ROOT / "edamame-ng.sh", env, "--scan", "--no-shell", "--output-dir", str(online_runs))
     online = next(online_runs.iterdir())

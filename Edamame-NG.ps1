@@ -7,14 +7,87 @@ param(
     [Parameter(ParameterSetName = 'Resume')][string]$RunId,
     [string]$OutputDir = (Join-Path $env:LOCALAPPDATA 'Edamame-NG\runs'),
     [string]$ToolDir,
+    [string]$CatalogDir,
+    [string]$Cve,
+    [string]$Poc,
     [ValidateRange(15, 3600)][int]$ToolTimeoutSeconds = 300,
     [switch]$NoShell
 )
 
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($CatalogDir)) { $CatalogDir = Join-Path $PSScriptRoot 'catalog' }
 $hostName = $env:COMPUTERNAME
 $cacheBase = Join-Path $env:LOCALAPPDATA 'Edamame-NG\cache'
 $runDir = $null
+
+function Get-CatalogEntries([string]$Path) {
+    $index = Join-Path $Path 'local-eop.tsv'
+    if (-not (Test-Path -LiteralPath $index -PathType Leaf)) { return @() }
+    return @(Import-Csv -LiteralPath $index -Delimiter "`t")
+}
+
+function Write-CveIndex([string]$CatalogPath, [string[]]$Suggested, [string]$Destination) {
+    $catalog = @{}
+    $indexPath = Join-Path $CatalogPath 'local-eop.tsv'
+    if (Test-Path -LiteralPath $indexPath -PathType Leaf) {
+        foreach ($item in @(Get-CatalogEntries $CatalogPath)) { $catalog[$item.cve] = $item }
+    } else {
+        Write-Warning 'Offline CVE catalog unavailable; retaining CVE.org links.'
+    }
+    $indexed = @('cve' + "`t" + 'status' + "`t" + 'platform' + "`t" + 'product' + "`t" + 'kev_date' + "`t" + 'reference')
+    foreach ($id in $Suggested) {
+        if ($catalog.ContainsKey($id)) {
+            $item = $catalog[$id]
+            $status = if ($item.platform -eq 'windows') { 'indexed-review-only' } else { 'platform-mismatch' }
+            $indexed += "$id`t$status`t$($item.platform)`t$($item.product)`t$($item.kev_date)`t$($item.reference)"
+        } else {
+            $indexed += "$id`tunindexed`t`t`t`thttps://www.cve.org/CVERecord?id=$id"
+        }
+    }
+    $indexed | Set-Content -LiteralPath $Destination -Encoding ASCII
+}
+
+if ($Poc) {
+    if ($Cve) { throw 'Choose one of -Cve or -Poc.' }
+    if ($Poc -cnotmatch '^CVE-[0-9]{4}-[0-9]{4,}$') { throw 'Invalid CVE ID.' }
+    $manifest = Join-Path $CatalogDir 'poc_refs.tsv'
+    if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { throw 'Offline PoC manifest unavailable.' }
+    "cve`tstatus`tsource`tpath`tsha256`treview_state"
+    $pocItems = @(Import-Csv -LiteralPath $manifest -Delimiter "`t" | Where-Object cve -eq $Poc)
+    if (-not $pocItems.Count) { "$Poc`tnot-indexed`t`t`t`t" }
+    foreach ($item in $pocItems) {
+        if ($item.offline_path -eq '-') {
+            "$Poc`treference-only`t$($item.source_url)`t`t`t$($item.review_state)"
+            continue
+        }
+        if ($item.offline_path -cnotmatch '^pocs/CVE-[0-9]{4}-[0-9]{4,}/[A-Za-z0-9._-]+$' -or
+            -not $item.offline_path.StartsWith("pocs/$Poc/", [StringComparison]::Ordinal) -or
+            $item.sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Invalid PoC manifest entry.' }
+        $asset = Join-Path $CatalogDir $item.offline_path
+        $file = Get-Item -LiteralPath $asset -ErrorAction Stop
+        if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'PoC asset must not be a link.' }
+        if ((Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash -ne $item.sha256) {
+            throw 'PoC asset digest mismatch.'
+        }
+        "$Poc`tverified-bundle`t$($item.source_url)`t$asset`t$($item.sha256)`t$($item.review_state)"
+    }
+    return
+}
+
+if ($Cve) {
+    if ($Cve -cnotmatch '^CVE-[0-9]{4}-[0-9]{4,}$') { throw 'Invalid CVE ID.' }
+    if (-not (Test-Path -LiteralPath (Join-Path $CatalogDir 'local-eop.tsv') -PathType Leaf)) {
+        throw 'Offline catalog unavailable.'
+    }
+    'cve' + "`t" + 'status' + "`t" + 'platform' + "`t" + 'product' + "`t" + 'kev_date' + "`t" + 'reference'
+    $item = @(Get-CatalogEntries $CatalogDir | Where-Object cve -eq $Cve | Select-Object -First 1)
+    if ($item.Count) {
+        "$Cve`tindexed-review-only`t$($item[0].platform)`t$($item[0].product)`t$($item[0].kev_date)`t$($item[0].reference)"
+    } else {
+        "$Cve`tunindexed`t`t`t`thttps://www.cve.org/CVERecord?id=$Cve"
+    }
+    return
+}
 
 function Set-PrivateDirectory([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -294,7 +367,8 @@ foreach ($name in @('tools.tsv', 'findings.tsv', 'attempts.tsv', 'coverage.tsv')
     Set-Content -LiteralPath (Join-Path $runDir $name) -Value '' -Encoding UTF8
 }
 Write-Host "[RUN] $runDir"
-Write-Host '[ENUM] Fetching official current release assets.'
+if ($ToolDir) { Write-Host '[ENUM] Loading verified local assets.' }
+else { Write-Host '[ENUM] Fetching official current release assets.' }
 
 $winpeas = Join-Path $capture 'winPEASany.exe'
 $winpeasBat = Join-Path $capture 'winPEAS.bat'
@@ -512,6 +586,7 @@ if ($sharpCollectedZip -and (Test-Path -LiteralPath $sharpCollectedZip.FullName)
 }
 $suggestedCves | ForEach-Object { "$_`thttps://www.cve.org/CVERecord?id=$_" } |
     Set-Content -LiteralPath (Join-Path $runDir 'cve-candidates.tsv') -Encoding ASCII
+Write-CveIndex $CatalogDir $suggestedCves (Join-Path $runDir 'cve-index.tsv')
 Write-Host '[SAVED] findings.tsv, coverage.tsv, attempts.tsv, tools.tsv'
 
 if ($recipe) {
