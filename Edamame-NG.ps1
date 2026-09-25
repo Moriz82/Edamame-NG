@@ -11,6 +11,7 @@ param(
     [string]$Cve,
     [string]$Poc,
     [ValidateRange(15, 3600)][int]$ToolTimeoutSeconds = 300,
+    [switch]$ApproveSystemService,
     [switch]$NoShell
 )
 
@@ -136,7 +137,7 @@ function Get-LatestSuccess {
             if (Test-Path -LiteralPath $candidate) {
                 try {
                     $saved = Get-Content -LiteralPath $candidate -Raw | ConvertFrom-Json
-                    if ($saved.host -eq $hostName -and $saved.recipe -in @('already-system', 'already-admin', 'uac-admin')) {
+                    if ($saved.host -eq $hostName -and $saved.recipe -in @('already-system', 'already-admin', 'uac-admin', 'admin-system', 'uac-admin-system')) {
                         return $candidate
                     }
                 } catch { }
@@ -264,6 +265,93 @@ function Get-ReleaseAsset([string]$Repo, [string]$Asset, [string]$Destination) {
     return $false
 }
 
+function Test-PsExecAsset([string]$Path, [string]$ExpectedDigest) {
+    try {
+        # Reviewed Microsoft Sysinternals PsExec64.exe v2.43. New releases need
+        # an explicit digest update and a fresh disposable-guest acceptance run.
+        $pinnedDigest = 'edfae1a69522f87b12c6dac3225d930e4848832e3c551ee1e7d31736bf4525ef'
+        if ($ExpectedDigest -ne $pinnedDigest) { return $false }
+        $file = Get-Item -LiteralPath $Path -ErrorAction Stop
+        if ($file.PSIsContainer) { return $false }
+        if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+        if ($file.VersionInfo.ProductName -ne 'Sysinternals PsExec') { return $false }
+        $signature = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+        if ($signature.Status -ne 'Valid' -or
+            $signature.SignerCertificate.Subject -notmatch '^CN=Microsoft Corporation,') { return $false }
+        if ($ExpectedDigest -notmatch '^[a-fA-F0-9]{64}$') { return $false }
+        return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -eq $ExpectedDigest
+    } catch { return $false }
+}
+
+function Get-PsExecAsset {
+    $destination = Join-Path $capture 'PsExec64.exe'
+    $digestPath = "$destination.sha256"
+    if ($Resume) {
+        if ((Test-Path -LiteralPath $digestPath) -and
+            (Test-PsExecAsset $destination (Get-Content -LiteralPath $digestPath -TotalCount 1))) {
+            return $destination
+        }
+        Write-Warning 'Saved PsExec asset is missing or no longer verified.'
+        return $null
+    }
+
+    $source = 'https://download.sysinternals.com/files/PSTools.zip'
+    $release = $null
+    try {
+        if ($ToolDir) {
+            $local = Join-Path $ToolDir 'PsExec64.exe'
+            $localDigest = "$local.sha256"
+            if (-not (Test-Path -LiteralPath $localDigest) -or
+                -not (Test-PsExecAsset $local (Get-Content -LiteralPath $localDigest -TotalCount 1))) {
+                throw 'local PsExec signature or SHA-256 verification failed'
+            }
+            Copy-Item -LiteralPath $local -Destination $destination
+            $source = $local
+            $release = 'local'
+        } else {
+            $archivePath = Join-Path $capture 'PSTools.zip'
+            Invoke-WebRequest -Uri $source -UseBasicParsing -OutFile $archivePath -TimeoutSec 180
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $archive = [IO.Compression.ZipFile]::OpenRead($archivePath)
+            try {
+                $entry = $archive.GetEntry('PsExec64.exe')
+                if (-not $entry) { throw 'PsExec64.exe absent from official archive' }
+                $inputStream = $entry.Open()
+                $outputStream = [IO.File]::Create($destination)
+                try { $inputStream.CopyTo($outputStream) }
+                finally { $outputStream.Dispose(); $inputStream.Dispose() }
+            } finally { $archive.Dispose() }
+            Remove-Item -LiteralPath $archivePath -Force
+            $release = (Get-Item -LiteralPath $destination).VersionInfo.FileVersion
+        }
+        $digest = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+        if (-not (Test-PsExecAsset $destination $digest)) { throw 'PsExec Authenticode verification failed' }
+        Set-Content -LiteralPath $digestPath -Value $digest -Encoding ASCII
+        $cacheDir = Join-Path $cacheBase 'microsoft_sysinternals'
+        Set-PrivateDirectory $cacheDir
+        Copy-Item -LiteralPath $destination -Destination (Join-Path $cacheDir 'PsExec64.exe') -Force
+        Set-Content -LiteralPath (Join-Path $cacheDir 'PsExec64.exe.sha256') -Value $digest -Encoding ASCII
+        Add-Content -LiteralPath (Join-Path $runDir 'tools.tsv') -Value "PsExec64.exe`t$release`t$source`t$digest"
+        return $destination
+    } catch {
+        Remove-Item -LiteralPath $destination, $digestPath -Force -ErrorAction SilentlyContinue
+        Write-Warning "Current PsExec unavailable: $($_.Exception.Message). Checking verified cache."
+    }
+
+    $cached = Join-Path $cacheBase 'microsoft_sysinternals\PsExec64.exe'
+    $cachedDigest = "$cached.sha256"
+    if ((Test-Path -LiteralPath $cachedDigest) -and
+        (Test-PsExecAsset $cached (Get-Content -LiteralPath $cachedDigest -TotalCount 1))) {
+        Copy-Item -LiteralPath $cached -Destination $destination
+        $digest = (Get-Content -LiteralPath $cachedDigest -TotalCount 1).Trim()
+        Set-Content -LiteralPath $digestPath -Value $digest -Encoding ASCII
+        Add-Content -LiteralPath (Join-Path $runDir 'tools.tsv') -Value "PsExec64.exe`tcache`t$cached`t$digest"
+        return $destination
+    }
+    Add-Content -LiteralPath (Join-Path $runDir 'tools.tsv') -Value "PsExec64.exe`tmissing`t-`t-"
+    return $null
+}
+
 function Test-SystemIdentity {
     return [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18'
 }
@@ -275,8 +363,71 @@ function Test-AdminIdentity {
 }
 
 function Test-AdminMembership {
-    $groups = (& whoami.exe /groups 2>&1 | Out-String)
+    $whoami = Join-Path ([Environment]::SystemDirectory) 'whoami.exe'
+    $groups = (& $whoami /groups 2>&1 | Out-String)
     return $groups -match 'S-1-5-32-544'
+}
+
+function Get-TrustedPowerShell {
+    $path = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+    $file = Get-Item -LiteralPath $path -ErrorAction Stop
+    if ($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'System PowerShell is not a regular file.'
+    }
+    $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName -ErrorAction Stop
+    if ($signature.Status -ne 'Valid' -or
+        $signature.SignerCertificate.Subject -notmatch '^CN=Microsoft (Windows|Corporation),') {
+        throw 'System PowerShell signature verification failed.'
+    }
+    return $file.FullName
+}
+
+function New-ProofMarker([string]$Name) {
+    $marker = Join-Path $capture ("$Name-$([Guid]::NewGuid().ToString('N')).txt")
+    if (Test-Path -LiteralPath $marker) { throw 'Proof marker collision.' }
+    return $marker
+}
+
+function Confirm-SystemService {
+    if ($ApproveSystemService) { return $true }
+    if (-not [Environment]::UserInteractive) { return $false }
+    $choice = Read-Host 'PsExec will accept the Sysinternals EULA and create a temporary local SYSTEM service. Approve? [y/N]'
+    return $choice -match '^[Yy]$'
+}
+
+function Invoke-SystemViaPsExec {
+    if (-not (Test-AdminIdentity)) { return $false }
+    $sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    if ($sessionId -lt 1) { Write-Warning 'No interactive desktop session for SYSTEM shell.'; return $false }
+    $digest = (Get-Content -LiteralPath "$psExecPath.sha256" -TotalCount 1).Trim()
+    if (-not (Test-PsExecAsset $psExecPath $digest)) { Write-Warning 'PsExec verification failed before launch.'; return $false }
+    $trustedPowerShell = Get-TrustedPowerShell
+    $marker = New-ProofMarker 'system-proof'
+    $quotedMarker = $marker.Replace("'", "''")
+    $systemChild = @"
+`$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+if (`$identity.User.Value -ne 'S-1-5-18') { exit 1 }
+Set-Content -LiteralPath '$quotedMarker' -Value `$identity.User.Value -Encoding ASCII
+"@
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($systemChild))
+    $shellArgs = @('-NoProfile')
+    if (-not $NoShell) { $shellArgs += '-NoExit' }
+    $shellArgs += @('-EncodedCommand', $encoded)
+    try {
+        $priorErrorAction = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            & $psExecPath -accepteula -nobanner -s -i $sessionId -d $trustedPowerShell @shellArgs *> $null
+        } finally { $ErrorActionPreference = $priorErrorAction }
+        for ($attempt = 0; $attempt -lt 30; $attempt++) {
+            if ((Test-Path -LiteralPath $marker) -and (Get-Content -LiteralPath $marker -TotalCount 1) -eq 'S-1-5-18') {
+                if ($NoShell) { Write-Host '[PROOF] SYSTEM token verified; shell suppressed.' }
+                return $true
+            }
+            Start-Sleep -Milliseconds 500
+        }
+    } catch { Write-Warning "SYSTEM shell launch failed: $($_.Exception.Message)" }
+    return $false
 }
 
 function Invoke-Recipe([string]$Recipe) {
@@ -284,31 +435,77 @@ function Invoke-Recipe([string]$Recipe) {
         'already-system' {
             if (-not (Test-SystemIdentity)) { return $false }
             if ($NoShell) { Write-Host '[PROOF] SYSTEM token verified; shell suppressed.' }
-            else { & powershell.exe -NoLogo -NoExit }
+            else { & (Get-TrustedPowerShell) -NoLogo -NoExit }
             return $true
         }
         'already-admin' {
             if (-not (Test-AdminIdentity)) { return $false }
             if ($NoShell) { Write-Host '[PROOF] Administrator token verified; shell suppressed.' }
-            else { & powershell.exe -NoLogo -NoExit }
+            else { & (Get-TrustedPowerShell) -NoLogo -NoExit }
             return $true
+        }
+        'admin-system' { return (Invoke-SystemViaPsExec) }
+        'uac-admin-system' {
+            if (-not (Test-AdminMembership)) { return $false }
+            $sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+            if ($sessionId -lt 1) { Write-Warning 'No interactive desktop session for SYSTEM shell.'; return $false }
+            $digest = (Get-Content -LiteralPath "$psExecPath.sha256" -TotalCount 1).Trim()
+            if (-not (Test-PsExecAsset $psExecPath $digest)) { return $false }
+            $trustedPowerShell = Get-TrustedPowerShell
+            $powerShellDigest = (Get-FileHash -LiteralPath $trustedPowerShell -Algorithm SHA256).Hash
+            $marker = New-ProofMarker 'system-proof'
+            $quotedMarker = $marker.Replace("'", "''")
+            $quotedPsExec = $psExecPath.Replace("'", "''")
+            $quotedPowerShell = $trustedPowerShell.Replace("'", "''")
+            $openChildShell = if ($NoShell) { '$false' } else { '$true' }
+            $systemChild = @"
+`$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+if (`$identity.User.Value -ne 'S-1-5-18') { exit 1 }
+Set-Content -LiteralPath '$quotedMarker' -Value `$identity.User.Value -Encoding ASCII
+"@
+            $encodedSystem = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($systemChild))
+            $child = @"
+`$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+`$principal = New-Object Security.Principal.WindowsPrincipal(`$identity)
+if (-not `$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 1 }
+if ((Get-FileHash -LiteralPath '$quotedPsExec' -Algorithm SHA256).Hash -ne '$digest') { exit 1 }
+`$signature = Get-AuthenticodeSignature -LiteralPath '$quotedPsExec'
+if (`$signature.Status -ne 'Valid' -or `$signature.SignerCertificate.Subject -notmatch '^CN=Microsoft Corporation,') { exit 1 }
+if ((Get-FileHash -LiteralPath '$quotedPowerShell' -Algorithm SHA256).Hash -ne '$powerShellDigest') { exit 1 }
+`$shellArgs = @('-NoProfile')
+if ($openChildShell) { `$shellArgs += '-NoExit' }
+`$shellArgs += @('-EncodedCommand', '$encodedSystem')
+& '$quotedPsExec' -accepteula -nobanner -s -i $sessionId -d '$quotedPowerShell' @shellArgs *> `$null
+"@
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($child))
+            try {
+                [void](Start-Process -FilePath $trustedPowerShell -ArgumentList "-NoProfile -EncodedCommand $encoded" -Verb RunAs -PassThru)
+                for ($attempt = 0; $attempt -lt 30; $attempt++) {
+                    if ((Test-Path -LiteralPath $marker) -and (Get-Content -LiteralPath $marker -TotalCount 1) -eq 'S-1-5-18') {
+                        if ($NoShell) { Write-Host '[PROOF] UAC to SYSTEM token verified; shell suppressed.' }
+                        return $true
+                    }
+                    Start-Sleep -Milliseconds 500
+                }
+            } catch { Write-Warning "UAC to SYSTEM elevation failed: $($_.Exception.Message)" }
+            return $false
         }
         'uac-admin' {
             if (-not (Test-AdminMembership)) { return $false }
-            $marker = Join-Path $runDir '.capture\uac-proof.txt'
-            Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+            $trustedPowerShell = Get-TrustedPowerShell
+            $marker = New-ProofMarker 'uac-proof'
             $quotedMarker = $marker.Replace("'", "''")
-            $openChildShell = if ($NoShell) { '$false' } else { '$true' }
             $child = @"
 `$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 `$principal = New-Object Security.Principal.WindowsPrincipal(`$identity)
 if (-not `$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 1 }
 Set-Content -LiteralPath '$quotedMarker' -Value `$identity.User.Value -Encoding ASCII
-if ($openChildShell) { & powershell.exe -NoLogo -NoExit }
 "@
             $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($child))
+            $shellArgs = if ($NoShell) { "-NoProfile -EncodedCommand $encoded" }
+                else { "-NoProfile -NoExit -EncodedCommand $encoded" }
             try {
-                $process = Start-Process -FilePath 'powershell.exe' -ArgumentList "-NoProfile -EncodedCommand $encoded" -Verb RunAs -PassThru
+                $process = Start-Process -FilePath $trustedPowerShell -ArgumentList $shellArgs -Verb RunAs -PassThru
                 for ($attempt = 0; $attempt -lt 30; $attempt++) {
                     if (Test-Path -LiteralPath $marker) {
                         if ($NoShell) { Write-Host '[PROOF] UAC Administrator token verified; shell suppressed.' }
@@ -349,15 +546,36 @@ if ($Resume) {
     $runDir = Split-Path -Parent $prior
     Set-PrivateDirectory $OutputDir
     Set-PrivateDirectory $runDir
-    Set-PrivateDirectory (Join-Path $runDir '.capture')
+    $capture = Join-Path $runDir '.capture'
+    Set-PrivateDirectory $capture
     $saved = Get-Content -LiteralPath $prior -Raw | ConvertFrom-Json
-    if ($saved.host -ne $hostName -or $saved.recipe -notin @('already-system', 'already-admin', 'uac-admin')) {
+    if ($saved.host -ne $hostName -or $saved.recipe -notin @('already-system', 'already-admin', 'uac-admin', 'admin-system', 'uac-admin-system')) {
         throw 'Saved run has an invalid host or recipe'
+    }
+    if ($saved.recipe -in @('admin-system', 'uac-admin-system')) {
+        if (-not (Confirm-SystemService)) {
+            Write-Attempt $saved.recipe 'resume-service-approval-declined'
+            throw 'SYSTEM service action requires fresh approval'
+        }
+        Write-Attempt $saved.recipe 'resume-service-approved'
+        $psExecPath = Get-PsExecAsset
+        if (-not $psExecPath) {
+            Write-Attempt $saved.recipe 'resume-psexec-unavailable'
+            throw 'Saved PsExec asset is unavailable; use -Scan'
+        }
     }
     Write-Host "[RESUME] $($saved.recipe) on $hostName; checking prerequisites again."
     if (Invoke-Recipe $saved.recipe) {
         Write-Attempt $saved.recipe 'resumed-proof'
         exit 0
+    }
+    if ($saved.recipe -in @('uac-admin', 'uac-admin-system') -and (Test-AdminMembership)) {
+        Write-Attempt $saved.recipe 'resume-elevation-not-completed'
+        throw 'Elevation did not complete; the saved recipe can be retried'
+    }
+    if ($saved.recipe -eq 'admin-system' -and (Test-AdminIdentity)) {
+        Write-Attempt $saved.recipe 'resume-system-not-completed'
+        throw 'SYSTEM elevation did not complete; the saved recipe can be retried'
     }
     Write-Attempt $saved.recipe 'resume-prerequisite-failed'
     throw 'Saved recipe no longer works; use -Scan'
@@ -601,6 +819,18 @@ Write-CveIndex $CatalogDir $suggestedCves (Join-Path $runDir 'cve-index.tsv')
 Write-Host '[SAVED] findings.tsv, coverage.tsv, attempts.tsv, tools.tsv'
 
 if ($recipe) {
+    if ($recipe -in @('already-admin', 'uac-admin')) {
+        if (Confirm-SystemService) {
+            Write-Attempt $recipe 'service-approved'
+            $psExecPath = Get-PsExecAsset
+            if ($psExecPath) {
+                $recipe = if ($recipe -eq 'uac-admin') { 'uac-admin-system' } else { 'admin-system' }
+                Write-Host '[RECIPE] Verified Microsoft PsExec available for local SYSTEM shell.'
+            }
+        } else {
+            Write-Attempt $recipe 'service-approval-declined'
+        }
+    }
     if (Invoke-Recipe $recipe) {
         [pscustomobject]@{ host = $hostName; recipe = $recipe; evidence = 'verified-local-proof' } |
             ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $runDir 'success.json') -Encoding UTF8

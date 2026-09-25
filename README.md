@@ -18,6 +18,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Edamame-NG.ps1 -Scan
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Edamame-NG.ps1 -Resume
 ```
 
+To also try an interactive SYSTEM shell from an administrator token, approve the temporary local PsExec service action for each launch:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Edamame-NG.ps1 -Scan -ApproveSystemService
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Edamame-NG.ps1 -Resume -ApproveSystemService
+```
+
+Without the switch, an interactive run asks before accepting the Sysinternals EULA and creating the service. On Scan, a declined or unavailable service action leaves the Administrator-only recipe available; Resume of a saved SYSTEM recipe stops until the action is approved again. The service route requires a signed Microsoft PsExec binary from the [official PsTools download](https://learn.microsoft.com/en-us/sysinternals/downloads/psexec); `-ToolDir` accepts `PsExec64.exe` with an adjacent `.sha256` file. The runner checks Authenticode, product name, and SHA-256, and checks the saved copy again on Resume. The binary is not included in this repository.
+
 Without `--scan`/`-Scan` or `--resume`/`-Resume`, a previous success offers Resume as the default. `--no-shell`/`-NoShell` proves a recipe without opening a shell. `--tool-dir`/`-ToolDir` accepts predownloaded assets only when each asset has an adjacent `.sha256` file containing its expected SHA-256. A new scan checks current official releases unless a tool directory is supplied. A failed update uses only a previously verified cache copy and prints a warning.
 
 For a scan with no network access, supply the verified local assets and the bundled catalog:
@@ -64,8 +73,10 @@ The CVE recipe is disabled on ordinary scans. Add `--enable-cve-2025-32463-lab` 
 | Windows | Already SYSTEM | Current token SID is `S-1-5-18` |
 | Windows | Already elevated Administrator | Current token has Administrator role |
 | Windows | Administrator membership with UAC | Elevated child verifies its token and writes a proof marker |
+| Windows | Elevated Administrator to SYSTEM | Approved, reviewed PsExec opens a shell in the current interactive session; the shell process verifies SID `S-1-5-18` |
+| Windows | Administrator membership with UAC to SYSTEM | UAC consent followed by the approved PsExec route; the SYSTEM shell process writes its identity proof |
 
-The Windows UAC path prompts through the operating system. It is elevation for a user who is already an administrator, not a standard-user to SYSTEM exploit. The scripts report unsupported paths instead of running unreviewed exploit binaries or changing services, tasks, privileged files, registry keys, drivers, or the kernel. CVE names from enumerators are suggestions with source links, not proof of vulnerability. The accepted sudo CVE recipe is limited to the exact lab build; it does not infer vulnerability from version text. Credential values in raw output are not replayed automatically. The `coverage.tsv` file says `checked`, `inapplicable`, or `unsupported` for each checklist area; incomplete enumerators leave their broad areas `unsupported` and get separate partial tool status rows.
+The Windows UAC paths prompt through the operating system. They start with a user who is already an administrator; the SYSTEM route is not a standard-user to SYSTEM exploit. PsExec's local service creation requires approval on Scan and again on Resume. PsExec may install a service executable under Windows, create service registry state, and persist its EULA acceptance; interruption may leave service residue. The runner pins the reviewed PsExec64.exe v2.43 digest, so a changed release fails closed pending review and disposable-guest acceptance. The scripts report other unsupported paths instead of running unreviewed exploit binaries or changing tasks, drivers, or the kernel. CVE names from enumerators are suggestions with source links, not proof of vulnerability. The accepted sudo CVE recipe is limited to the exact lab build; it does not infer vulnerability from version text. Credential values in raw output are not replayed automatically. The `coverage.tsv` file says `checked`, `inapplicable`, or `unsupported` for each checklist area; incomplete enumerators leave their broad areas `unsupported` and get separate partial tool status rows.
 
 On domain joined Windows hosts, the script runs SharpHound **Default** collection. This queries other domain joined computers and can take longer than local checks. Its ZIP is left for the operator. No off-host exploitation, relay, or poisoning is performed.
 
@@ -82,8 +93,10 @@ pwsh -NoProfile -File tests/test_release.ps1
 pwsh -NoProfile -File tests/test_windows_catalog.ps1
 ```
 
+On a disposable Windows guest, `tests/test_psexec.ps1 -ArchivePath <verified-PSTools.zip>` checks official archive extraction, Authenticode, SHA-256, verified-cache fallback, and tamper rejection without contacting the network. It requires the current official ZIP as an external fixture.
+
 The PowerShell release test parses `Edamame-NG.ps1` and checks local and release digest handling. It runs on PowerShell 7 for development. The Windows capture and ACL tests exercise subprocess completion, failure, timeouts, private directories, and same-host Resume selection on Windows PowerShell 5.1. These focused tests use fake assets, never exercise privilege escalation, and make no network requests.
 
 `tests/integration_suid_find.sh` repeats the SUID `find` Scan/Resume checks with fake offline enumerators. Run it only as root inside an explicitly disposable **unprivileged LXC** guest with `EDAMAME_DISPOSABLE_LXC=1`; it refuses other environments with exit 77, restores `/usr/bin/find` ownership and mode, and deletes its temporary outputs.
 
-isolated Proxmox acceptance uses disposable, snapshot-restorable guests. Keep non-test guests and other test guests unchanged. Test fresh clones on isolated bridges, verify an elevated shell and Resume, then delete the clones. See [acceptance-2026-09-25.md](docs/acceptance-2026-09-25.md), the first [test matrix](docs/matrix-2026-09-25.md), [extended acceptance](docs/extended-acceptance-2026-09-25.md), [workgroup acceptance](docs/workgroup-acceptance-2026-09-25.md), [CVE-2025-32463 acceptance](docs/cve-2025-32463-acceptance-2026-09-25.md), [Windows 5.1 catalog acceptance](docs/windows-5.1-catalog-acceptance-2026-09-25.md), the [additional distribution matrix](docs/additional-matrix-2026-09-25.md), and [SUID find acceptance](docs/suid-find-acceptance-2026-09-25.md) for observed results and gaps. A Windows standard-user to SYSTEM recipe must pass acceptance before being enabled.
+isolated Proxmox acceptance uses disposable, snapshot-restorable guests. Keep non-test guests and other test guests unchanged. Test fresh clones on isolated bridges, verify an elevated shell and Resume, then delete the clones. See [acceptance-2026-09-25.md](docs/acceptance-2026-09-25.md), the first [test matrix](docs/matrix-2026-09-25.md), [extended acceptance](docs/extended-acceptance-2026-09-25.md), [workgroup acceptance](docs/workgroup-acceptance-2026-09-25.md), [CVE-2025-32463 acceptance](docs/cve-2025-32463-acceptance-2026-09-25.md), [Windows 5.1 catalog acceptance](docs/windows-5.1-catalog-acceptance-2026-09-25.md), the [additional distribution matrix](docs/additional-matrix-2026-09-25.md), [SUID find acceptance](docs/suid-find-acceptance-2026-09-25.md), and [Windows UAC to SYSTEM acceptance](docs/windows-uac-system-acceptance-2026-09-25.md) for observed results and gaps. A Windows standard-user to SYSTEM recipe must pass acceptance before being enabled.
