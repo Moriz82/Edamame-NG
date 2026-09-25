@@ -14,11 +14,15 @@ $directCurated = @(& $source -Cve 'CVE-2023-4911')
 if ($directCurated.Count -lt 2 -or $directCurated[1] -notmatch 'indexed-review-only\tlinux\tglibc') {
     throw 'Curated CVE lookup failed'
 }
+$directGeneral = @(& $source -Cve 'CVE-2021-44228')
+if ($directGeneral.Count -lt 2 -or $directGeneral[1] -notmatch 'published-general') {
+    throw 'General CVE lookup failed'
+}
 $directPoc = @(& $source -Poc 'CVE-2025-32463')
 if ($directPoc.Count -lt 2 -or $directPoc[1] -notmatch 'verified-bundle') {
     throw 'Direct PoC lookup failed'
 }
-foreach ($name in @('Get-CatalogEntries', 'Write-CveIndex')) {
+foreach ($name in @('Get-CatalogEntries', 'Get-GeneralCveState', 'Write-CveIndex')) {
     $fn = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
     . ([scriptblock]::Create($fn.Extent.Text))
 }

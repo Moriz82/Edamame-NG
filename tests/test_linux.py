@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -43,6 +44,8 @@ with tempfile.TemporaryDirectory(prefix="edamame-test-") as temp:
     write(fake / "curl", """#!/usr/bin/env python3
 import hashlib, os, pathlib, sys
 args=sys.argv[1:]
+if os.environ.get('EDAMAME_TEST_CURL_MARKER'):
+    pathlib.Path(os.environ['EDAMAME_TEST_CURL_MARKER']).write_text('called')
 if os.environ.get('EDAMAME_TEST_CURL_FAIL'):
     sys.exit(22)
 url=next(arg for arg in args if arg.startswith('https://'))
@@ -85,7 +88,6 @@ else:
     verbose_dir = next(verbose_runs.iterdir())
     assert "password=keep-private" in verbose.stdout
     assert "including possible credentials" in verbose.stderr
-    assert verbose.stdout.index("password=keep-private") < verbose.stdout.index("[FOUND]")
     assert verbose.stdout.index("[FOUND]") < verbose.stdout.index("[SAVED] linpeas-output.txt")
     assert "password=keep-private" in (verbose_dir / "linpeas-output.txt").read_text()
     assert "linpeas\tchecked" in (verbose_dir / "coverage.tsv").read_text()
@@ -163,6 +165,14 @@ else:
     run(ROOT / "edamame-ng.sh", failed_env, "--scan", "--no-shell", "--output-dir", str(online_runs))
     cached = max(online_runs.iterdir(), key=lambda path: path.name)
     assert "linpeas.sh\tcache" in (cached / "tools.tsv").read_text()
+    network_marker = base / "network-called"
+    offline_env = dict(env, EDAMAME_TEST_CURL_MARKER=str(network_marker))
+    offline_runs = base / "offline-runs"
+    run(ROOT / "edamame-ng.sh", offline_env, "--scan", "--offline", "--no-shell",
+        "--output-dir", str(offline_runs))
+    offline = next(offline_runs.iterdir())
+    assert "linpeas.sh\tcache" in (offline / "tools.tsv").read_text()
+    assert not network_marker.exists(), "offline scan made a network request"
     legacy_runs = base / "legacy-runs"
     legacy_env = dict(env, EDAMAME_TEST_NO_LSE_DIGEST="1")
     run(ROOT / "edamame-ng.sh", legacy_env, "--scan", "--no-shell", "--output-dir", str(legacy_runs))
@@ -204,4 +214,27 @@ else:
     linked = run(ROOT / "edamame-ng.sh", env, "--scan", "--no-shell",
                  "--output-dir", str(link), "--tool-dir", str(tools), check=False)
     assert linked.returncode == 2 and "symbolic links" in linked.stderr
+    slow_tools = base / "slow-tools"
+    slow_tools.mkdir()
+    for name in ("linpeas.sh", "lse.sh"):
+        asset = slow_tools / name
+        write(asset, "#!/bin/sh\necho CVE-2024-123456\nsleep 3\necho completed-after-shell\n")
+        (slow_tools / (name + ".sha256")).write_text(hashlib.sha256(asset.read_bytes()).hexdigest() + "\n")
+    fast_runs = base / "fast-runs"
+    start = time.monotonic()
+    fast = run(ROOT / "edamame-ng.sh", env, "--scan", "--offline",
+               "--output-dir", str(fast_runs), "--tool-dir", str(slow_tools))
+    assert time.monotonic() - start < 2.5, fast.stdout
+    fast_dir = next(fast_runs.iterdir())
+    assert "linpeas\tpartial" in (fast_dir / "coverage.tsv").read_text()
+    assert fast.stdout.index("[FOUND]") < fast.stdout.index("[SAVED] linpeas-output.txt")
+    finished_runs = base / "finished-runs"
+    start = time.monotonic()
+    finished = run(ROOT / "edamame-ng.sh", env, "--scan", "--offline", "--finish-bg-enum",
+                   "--output-dir", str(finished_runs), "--tool-dir", str(slow_tools), check=False)
+    assert finished.returncode == 0, finished.stdout + finished.stderr
+    assert time.monotonic() - start >= 2.5
+    finished_dir = next(finished_runs.iterdir())
+    assert "linpeas\tchecked" in (finished_dir / "coverage.tsv").read_text()
+    assert "completed-after-shell" in (finished_dir / "linpeas-output.txt").read_text()
     print("Linux scan, alert order, partial capture, digest failures, cache, masking, resume rejection, and path guards passed")

@@ -152,13 +152,14 @@ function Write-PipeFrame([IO.BinaryWriter]$Writer, [string]$Value) {
 }
 
 function Read-PipeBytes([IO.Stream]$Stream, [int]$Count, [int]$TimeoutMilliseconds) {
-    $bytes = [byte[]]::new($Count)
+    $bytes = New-Object byte[] $Count
     $offset = 0
     while ($offset -lt $Count) {
-        $read = $Stream.ReadAsync($bytes, $offset, $Count - $offset)
-        if (-not $read.Wait($TimeoutMilliseconds)) { throw 'Pipe read timed out' }
-        if ($read.Result -le 0) { throw 'Incomplete pipe frame' }
-        $offset += $read.Result
+        $pending = $Stream.BeginRead($bytes, $offset, $Count - $offset, $null, $null)
+        if (-not $pending.AsyncWaitHandle.WaitOne($TimeoutMilliseconds)) { throw 'Pipe read timed out' }
+        $read = $Stream.EndRead($pending)
+        if ($read -le 0) { throw 'Incomplete pipe frame' }
+        $offset += $read
     }
     return ,$bytes
 }
@@ -183,27 +184,27 @@ function Invoke-WeakServiceLabRecipe([string]$ExpectedFixtureId) {
         $cmdSignature.Status -ne 'Valid' -or
         $cmdSignature.SignerCertificate.Subject -notmatch '^CN=Microsoft (Windows|Corporation),') { return $false }
     $pipeName = 'EdamameNG-' + [Guid]::NewGuid().ToString('N')
-    $nonceBytes = [byte[]]::new(32)
+    $nonceBytes = New-Object byte[] 32
     $random = [Security.Cryptography.RandomNumberGenerator]::Create()
     try { $random.GetBytes($nonceBytes) } finally { $random.Dispose() }
     $nonce = [BitConverter]::ToString($nonceBytes).Replace('-', '')
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
     $pipeAcl = New-Object IO.Pipes.PipeSecurity
     $pipeAcl.SetAccessRuleProtection($true, $false)
-    foreach ($allowed in @($sid, ([Security.Principal.SecurityIdentifier]::new('S-1-5-18')))) {
-        $rule = [IO.Pipes.PipeAccessRule]::new($allowed, [IO.Pipes.PipeAccessRights]::ReadWrite, [Security.AccessControl.AccessControlType]::Allow)
+    foreach ($allowed in @($sid, (New-Object Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-18'))) {
+        $rule = New-Object IO.Pipes.PipeAccessRule -ArgumentList $allowed, ([IO.Pipes.PipeAccessRights]::ReadWrite), ([Security.AccessControl.AccessControlType]::Allow)
         $pipeAcl.AddAccessRule($rule)
     }
-    $pipe = [IO.Pipes.NamedPipeServerStream]::new(
+    $pipe = New-Object IO.Pipes.NamedPipeServerStream -ArgumentList @(
         $pipeName, [IO.Pipes.PipeDirection]::InOut, 1,
         [IO.Pipes.PipeTransmissionMode]::Byte, [IO.Pipes.PipeOptions]::Asynchronous,
         4096, 4096, $pipeAcl)
     $clientCode = @"
-`$p = [IO.Pipes.NamedPipeClientStream]::new('.', '$pipeName', [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::None, [Security.Principal.TokenImpersonationLevel]::Impersonation)
+`$p = New-Object IO.Pipes.NamedPipeClientStream -ArgumentList '.', '$pipeName', ([IO.Pipes.PipeDirection]::InOut), ([IO.Pipes.PipeOptions]::None), ([Security.Principal.TokenImpersonationLevel]::Impersonation)
 try {
     `$p.Connect(15000)
-    `$r = [IO.BinaryReader]::new(`$p, [Text.Encoding]::UTF8)
-    `$w = [IO.BinaryWriter]::new(`$p, [Text.Encoding]::UTF8)
+    `$r = New-Object IO.BinaryReader -ArgumentList `$p, ([Text.Encoding]::UTF8)
+    `$w = New-Object IO.BinaryWriter -ArgumentList `$p, ([Text.Encoding]::UTF8)
     function send([string]`$s) {
         `$b = [Text.Encoding]::UTF8.GetBytes(`$s)
         if (`$b.Length -gt 1048576) { `$b = [Text.Encoding]::UTF8.GetBytes('Output exceeds 1 MiB limit') }
@@ -317,9 +318,10 @@ while (`$true) {
             throw 'Weak-service fixture changed before start'
         }
         $starter = Start-Process -FilePath $trustedSc -ArgumentList @('start', 'EdamameWeakSvc') -PassThru -WindowStyle Hidden
-        $connected = $pipe.WaitForConnectionAsync()
-        if (-not $connected.Wait(20000)) { throw 'SYSTEM pipe connection timed out' }
-        $writer = [IO.BinaryWriter]::new($pipe, [Text.Encoding]::UTF8)
+        $connected = $pipe.BeginWaitForConnection($null, $null)
+        if (-not $connected.AsyncWaitHandle.WaitOne(20000)) { throw 'SYSTEM pipe connection timed out' }
+        $pipe.EndWaitForConnection($connected)
+        $writer = New-Object IO.BinaryWriter -ArgumentList $pipe, ([Text.Encoding]::UTF8)
         $hello = Read-PipeFrame $pipe 256 10000
         if ($hello -cne "1|$nonce|S-1-5-18") { throw 'SYSTEM pipe identity proof failed' }
         if ([EdamameWeakServiceNative]::ConnectedClientSid($pipe) -cne 'S-1-5-18') {

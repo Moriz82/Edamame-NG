@@ -12,7 +12,7 @@ bash edamame-ng.sh --scan --verbose --output-dir "$HOME/edamame-ng-runs"
 bash edamame-ng.sh --resume --output-dir "$HOME/edamame-ng-runs"
 ```
 
-Windows (Windows PowerShell 5.1 or later):
+Windows (Windows PowerShell 3.0 or later):
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Edamame-NG.ps1 -Scan
@@ -40,21 +40,23 @@ The fixture creates a stopped, manual LocalSystem service and a protected regist
 
 Without `--scan`/`-Scan` or `--resume`/`-Resume`, a previous success offers Resume as the default. `--no-shell`/`-NoShell` proves a recipe without opening a shell. `--tool-dir`/`-ToolDir` accepts predownloaded assets only when each asset has an adjacent `.sha256` file containing its expected SHA-256. A new scan checks current official releases unless a tool directory is supplied. A failed update uses only a previously verified cache copy and prints a warning.
 
+Scans start supported enumerators while native recipe checks run. A verified route can open a shell before enumeration finishes. By default, remaining collectors stop after a successful interactive proof and their output is labeled partial. Use `--finish-bg-enum` or `-FinishBgEnum` to let them finish while the shell is open; final named output files are saved after the shell exits. With `--no-shell`/`-NoShell`, collectors finish for a complete evidence run. Enumerator CVE strings are screened as output grows, but they are review leads and do not trigger unreviewed exploit code.
+
 For a scan with no network access, supply the verified local assets and the bundled catalog:
 
 ```sh
-bash edamame-ng.sh --scan --tool-dir ./offline-assets
+bash edamame-ng.sh --scan --offline --tool-dir ./offline-assets
 bash edamame-ng.sh --cve CVE-2025-32463
 bash edamame-ng.sh --poc CVE-2025-32463
 ```
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Edamame-NG.ps1 -Scan -ToolDir .\offline-assets
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Edamame-NG.ps1 -Scan -Offline -ToolDir .\offline-assets
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Edamame-NG.ps1 -Cve CVE-2021-36934
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Edamame-NG.ps1 -Poc CVE-2025-32463
 ```
 
-`--cve`/`-Cve` reads the local CVE index. `--poc`/`-Poc` reports an offline PoC file only after checking its SHA-256; it does not execute it. Both query modes work without a scan or network request. Use `--catalog-dir`/`-CatalogDir` to select another local catalog. A scan also saves `cve-index.tsv`, which joins enumerator suggestions to local catalog candidates and labels unindexed or wrong-platform IDs.
+`--offline`/`-Offline` prohibits release checks and downloads; only adjacent-digest local assets and previously verified cache copies are used. Windows skips SharpHound domain collection in this mode. Third-party enumerators may still perform their own network checks, so use host network isolation if a strict no-network run is required. `--cve`/`-Cve` reads the local CVE index. `--poc`/`-Poc` reports an offline PoC file only after checking its SHA-256; it does not execute it. Both query modes work without a scan or network request. Use `--catalog-dir`/`-CatalogDir` to select another local catalog. A scan saves `cve-index.tsv`, which distinguishes local escalation review leads, general published CVEs, rejected or reserved IDs, unindexed IDs, and wrong-platform leads.
 
 The older LSE release does not publish a SHA-256 in GitHub's release listing. For that asset, Edamame-NG prints a warning, hashes the official HTTPS download, and uses that hash to check later cached copies. This is a recorded digest, not independent upstream checksum validation. Windows has `-ToolTimeoutSeconds` (default 300) to retain partial output when an external enumerator stalls; Linux uses 600 seconds for each enumerator.
 
@@ -65,6 +67,8 @@ The run directory is private (mode 700 on Linux; an explicit current-user and SY
 `tools.tsv` records release tag, source, and SHA-256. `findings.tsv`, `attempts.tsv`, `coverage.tsv`, `cve-candidates.tsv`, and `cve-index.tsv` provide the decision record. A successful recipe is recorded by ID and evidence in `success.tsv` or `success.json`. Resume checks its prerequisites again and skips enumeration.
 
 ## Offline CVE and PoC catalog
+
+`catalog/cve-ids/YYYY.tsv` contains 397,443 IDs and record states from the [official CVE List V5 daily baseline](https://github.com/CVEProject/cvelistV5/releases), split by year for fast lookups without loading the whole list. The compact files total about 9.4 MB. `catalog/cve-ids-source.json` records the baseline asset and its SHA-256, which was checked against the release-published digest. `scripts/build_cve_ids.py --input verified-baseline.zip.zip --expected-sha256 <published-digest>` rebuilds the index at development time without fetching data. This index contains every ID in that dated baseline, including non-local CVEs; it provides no product, build, patch, or exploit applicability.
 
 `catalog/local-eop.tsv` contains 118 compact **candidate** records selected from the [CISA KEV catalog](https://github.com/cisagov/kev-data). `catalog/source.json` records the source version, release date, record count, and SHA-256 of the source snapshot. `scripts/update_catalog.py --input verified-kev.json` rebuilds it at development time without fetching data. `catalog/curated-eop.tsv` adds nine review leads outside that KEV selection; [curated-advisories.md](catalog/curated-advisories.md) keeps their affected conditions and primary-source links available offline. An empty `kev_date` does not claim KEV status. The base catalog takes precedence if an ID appears in both files. The filter checks local privilege escalation terms and broad Windows/Linux product names. It can miss a relevant CVE or include one that does not apply to a host. A KEV listing confirms observed exploitation somewhere; it does not establish a vulnerable local build, missing patch, or safe exploit path. Edamame-NG never selects an escalation recipe from this text match alone.
 
@@ -106,13 +110,14 @@ python3 tests/test_catalog.py
 pwsh -NoProfile -File tests/test_release.ps1
 pwsh -NoProfile -File tests/test_windows_catalog.ps1
 pwsh -NoProfile -File tests/test_capture_verbose.ps1
+pwsh -NoProfile -File tests/test_windows_async.ps1
 ```
 
 On a disposable Windows guest, `tests/test_psexec.ps1 -ArchivePath <verified-PSTools.zip>` checks official archive extraction, Authenticode, SHA-256, verified-cache fallback, and tamper rejection without contacting the network. It requires the current official ZIP as an external fixture.
 
 `tests/test_windows_weak_service.ps1` checks native PowerShell 5.1 parsing, the service adapter, bounded pipe frames, and independent pipe-client SID observation. Run it as the standard fixture user with `-ExpectedNotSystem` as well as under the guest administrator account. The [weak-service acceptance record](docs/windows-weak-service-acceptance-2026-09-25.md) includes the standard-user shell, Resume, refusal and prerequisite failures, forced parent termination, restoration, and disposable VM cleanup.
 
-The PowerShell release test parses `Edamame-NG.ps1` and checks local and release digest handling. It runs on PowerShell 7 for development. The Windows capture and ACL tests exercise subprocess completion, failure, timeouts, private directories, and same-host Resume selection on Windows PowerShell 5.1. These focused tests use fake assets, never exercise privilege escalation, and make no network requests.
+The PowerShell release test parses `Edamame-NG.ps1` and checks local and release digest handling. It runs on PowerShell 7 for development. Earlier Windows PowerShell 5.1 acceptance covered capture, ACLs, and same-host Resume before this concurrent scan change. The new asynchronous test checks concurrent collectors and live CVE screening locally. Windows PowerShell 3.0 is the intended minimum; native 3.0 and 5.1 guest runs remain necessary for this revision. These focused tests use fake assets, never exercise privilege escalation, and make no network requests. The [offline and concurrent check record](docs/offline-concurrency-acceptance-2026-09-25.md) lists the evidence and pending guest checks.
 
 `tests/integration_suid_find.sh` repeats the SUID `find` Scan/Resume checks with fake offline enumerators. Run it only as root inside an explicitly disposable **unprivileged LXC** guest with `EDAMAME_DISPOSABLE_LXC=1`; it refuses other environments with exit 77, restores `/usr/bin/find` ownership and mode, and deletes its temporary outputs.
 

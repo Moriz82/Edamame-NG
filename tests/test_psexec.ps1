@@ -5,7 +5,7 @@ $tokens = $null
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($source, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw "PowerShell parse failed: $errors" }
-foreach ($name in @('Set-PrivateDirectory', 'Test-PsExecAsset', 'Get-PsExecAsset', 'Get-TrustedPowerShell', 'New-ProofMarker')) {
+foreach ($name in @('Set-PrivateDirectory', 'Expand-VerifiedZip', 'Test-PsExecAsset', 'Get-PsExecAsset', 'Get-TrustedPowerShell', 'New-ProofMarker')) {
     $fn = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
     . ([scriptblock]::Create($fn.Extent.Text))
 }
@@ -45,6 +45,7 @@ try {
     }
     Remove-Item -LiteralPath $asset, "$asset.sha256" -Force
     $script:offline = $true
+    $Offline = $true
     if (-not (Get-PsExecAsset)) { throw 'Verified cache fallback failed' }
     if ((Get-Content -LiteralPath (Join-Path $runDir 'tools.tsv') -Raw) -notmatch 'PsExec64.exe\tcache') {
         throw 'Cache provenance missing'

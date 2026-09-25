@@ -1,4 +1,4 @@
-#requires -Version 5.1
+#requires -Version 3.0
 <# Edamame-NG: Windows host enumeration and bounded local elevation. #>
 [CmdletBinding(DefaultParameterSetName = 'Auto')]
 param(
@@ -10,6 +10,8 @@ param(
     [string]$CatalogDir,
     [string]$Cve,
     [string]$Poc,
+    [switch]$Offline,
+    [switch]$FinishBgEnum,
     [ValidateRange(15, 3600)][int]$ToolTimeoutSeconds = 300,
     [switch]$ApproveSystemService,
     [switch]$EnableWeakServiceLab,
@@ -24,6 +26,20 @@ $cacheBase = Join-Path $env:LOCALAPPDATA 'Edamame-NG\cache'
 $runDir = $null
 $weakServiceEvidence = $null
 
+# Get-FileHash and Expand-Archive are absent from Windows PowerShell 3.0.
+if (-not (Get-Command Get-FileHash -ErrorAction SilentlyContinue)) {
+    function Get-FileHash {
+        param([string]$LiteralPath, [string]$Path, [string]$Algorithm = 'SHA256')
+        if ($Algorithm -ne 'SHA256') { throw 'Only SHA256 is supported.' }
+        $target = if ($LiteralPath) { $LiteralPath } else { $Path }
+        $stream = [IO.File]::OpenRead($target)
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try { $digest = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '') }
+        finally { $sha.Dispose(); $stream.Dispose() }
+        return [pscustomobject]@{ Hash = $digest }
+    }
+}
+
 function Get-CatalogEntries([string]$Path) {
     $rows = @()
     foreach ($name in @('local-eop.tsv', 'curated-eop.tsv')) {
@@ -33,6 +49,16 @@ function Get-CatalogEntries([string]$Path) {
         }
     }
     return $rows
+}
+
+function Get-GeneralCveState([string]$CatalogPath, [string]$Id) {
+    $year = $Id.Substring(4, 4)
+    $index = Join-Path (Join-Path $CatalogPath 'cve-ids') "$year.tsv"
+    if (-not (Test-Path -LiteralPath $index -PathType Leaf)) { return 'unindexed' }
+    $match = Select-String -LiteralPath $index -Pattern "^$Id`t(published|rejected|reserved)$" |
+        Select-Object -First 1
+    if (-not $match) { return 'unindexed' }
+    return (($match.Line -split "`t")[1] + '-general')
 }
 
 function Write-CveIndex([string]$CatalogPath, [string[]]$Suggested, [string]$Destination) {
@@ -52,7 +78,8 @@ function Write-CveIndex([string]$CatalogPath, [string[]]$Suggested, [string]$Des
             $status = if ($item.platform -eq 'windows') { 'indexed-review-only' } else { 'platform-mismatch' }
             $indexed += "$id`t$status`t$($item.platform)`t$($item.product)`t$($item.kev_date)`t$($item.reference)"
         } else {
-            $indexed += "$id`tunindexed`t`t`t`thttps://www.cve.org/CVERecord?id=$id"
+            $state = Get-GeneralCveState $CatalogPath $id
+            $indexed += "$id`t$state`t`t`t`thttps://www.cve.org/CVERecord?id=$id"
         }
     }
     $indexed | Set-Content -LiteralPath $Destination -Encoding ASCII
@@ -95,7 +122,8 @@ if ($Cve) {
     if ($item.Count) {
         "$Cve`tindexed-review-only`t$($item[0].platform)`t$($item[0].product)`t$($item[0].kev_date)`t$($item[0].reference)"
     } else {
-        "$Cve`tunindexed`t`t`t`thttps://www.cve.org/CVERecord?id=$Cve"
+        $state = Get-GeneralCveState $CatalogDir $Cve
+        "$Cve`t$state`t`t`t`thttps://www.cve.org/CVERecord?id=$Cve"
     }
     return
 }
@@ -129,8 +157,9 @@ function Set-PrivateDirectory([string]$Path) {
     $none = [System.Security.AccessControl.PropagationFlags]::None
     $allow = [System.Security.AccessControl.AccessControlType]::Allow
     $full = [System.Security.AccessControl.FileSystemRights]::FullControl
-    foreach ($sid in @($identity, ([System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')))) {
-        $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid, $full, $inherit, $none, $allow))
+    foreach ($sid in @($identity, (New-Object System.Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-18'))) {
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList $sid, $full, $inherit, $none, $allow
+        $acl.AddAccessRule($rule)
     }
     $item.SetAccessControl($acl)
     $allowed = @($identity.Value, 'S-1-5-18')
@@ -190,20 +219,13 @@ function Write-CapturedTail([string[]]$Paths, [long[]]$Offsets, [Text.Decoder[]]
 function Invoke-CapturedProcess([string]$FilePath, [string]$Arguments, [string]$OutputPath, [int]$TimeoutSeconds) {
     $stdout = "$OutputPath.stdout"
     $stderr = "$OutputPath.stderr"
-    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $FilePath
-    $startInfo.Arguments = $Arguments
-    $startInfo.WorkingDirectory = Split-Path -Parent $OutputPath
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    $process = [Diagnostics.Process]::Start($startInfo)
-    $outStream = [IO.FileStream]::new($stdout, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite, 1, [IO.FileOptions]::Asynchronous)
-    $errStream = [IO.FileStream]::new($stderr, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite, 1, [IO.FileOptions]::Asynchronous)
+    $options = @{ FilePath = $FilePath; PassThru = $true
+        RedirectStandardOutput = $stdout; RedirectStandardError = $stderr }
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { $options.WindowStyle = 'Hidden' }
+    if ($Arguments) { $options.ArgumentList = $Arguments }
+    $process = Start-Process @options
+    Set-Content -LiteralPath "$OutputPath.pid" -Value $process.Id -Encoding ASCII
     try {
-        $outCopy = $process.StandardOutput.BaseStream.CopyToAsync($outStream)
-        $errCopy = $process.StandardError.BaseStream.CopyToAsync($errStream)
         if ($script:ShowRawOutput) {
             $paths = @($stdout, $stderr)
             $offsets = [long[]]@(0, 0)
@@ -224,19 +246,13 @@ function Invoke-CapturedProcess([string]$FilePath, [string]$Arguments, [string]$
             [void]$process.WaitForExit(5000)
             Write-Warning "$([IO.Path]::GetFileName($FilePath)) exceeded $TimeoutSeconds seconds; preserving partial output."
         }
-        foreach ($copy in @($outCopy, $errCopy)) {
-            try { [void]$copy.Wait(5000) } catch { }
-        }
         if ($script:ShowRawOutput) {
-            $outStream.Flush()
-            $errStream.Flush()
             Write-CapturedTail $paths $offsets $decoders
         }
         $exitCode = if ($finished) { $process.ExitCode } else { -1 }
     } finally {
-        $outStream.Dispose()
-        $errStream.Dispose()
         $process.Dispose()
+        Remove-Item -LiteralPath "$OutputPath.pid" -Force -ErrorAction SilentlyContinue
     }
     $destination = [IO.File]::Create($OutputPath)
     try {
@@ -251,6 +267,133 @@ function Invoke-CapturedProcess([string]$FilePath, [string]$Arguments, [string]$
     if (-not $finished) { return 'timeout' }
     if ($exitCode -ne 0) { return 'partial' }
     return 'checked'
+}
+
+function Start-EnumJob([string]$Name, [string]$FilePath, [string]$Arguments, [string]$OutputPath) {
+    $definition = ${function:Invoke-CapturedProcess}.ToString()
+    $job = Start-Job -ScriptBlock {
+        param($command, $arguments, $path, $limit, $source)
+        . ([scriptblock]::Create("function Invoke-CapturedProcess { $source }"))
+        $script:ShowRawOutput = $false
+        Invoke-CapturedProcess $command $arguments $path $limit
+    } -ArgumentList $FilePath, $Arguments, $OutputPath, $ToolTimeoutSeconds, $definition
+    return @{ Name = $Name; Job = $job; Output = $OutputPath; Offset = [long]0; Stopped = $false }
+}
+
+function Stop-EnumJob($Entry) {
+    $pidPath = "$($Entry.Output).pid"
+    for ($i = 0; $i -lt 20 -and -not (Test-Path -LiteralPath $pidPath) -and
+        $Entry.Job.State -in @('NotStarted', 'Running'); $i++) {
+        Start-Sleep -Milliseconds 100
+    }
+    if (Test-Path -LiteralPath $pidPath) {
+        $childPid = Get-Content -LiteralPath $pidPath -TotalCount 1
+        if ($childPid -match '^[0-9]+$') {
+            try {
+                if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+                    & taskkill.exe /PID $childPid /T /F *> $null
+                } else { Stop-Process -Id ([int]$childPid) -Force }
+            } catch { }
+        }
+    } else { Stop-Job -Job $Entry.Job -ErrorAction SilentlyContinue }
+    $Entry.Stopped = $true
+}
+
+function Complete-EnumJob($Entry) {
+    [void](Wait-Job -Job $Entry.Job -Timeout ($ToolTimeoutSeconds + 10))
+    if ($Entry.Job.State -notin @('Completed', 'Failed', 'Stopped')) {
+        Stop-EnumJob $Entry
+        Stop-Job -Job $Entry.Job -ErrorAction SilentlyContinue
+    }
+    if ($Entry.Job.State -eq 'Failed' -and (Test-Path -LiteralPath "$($Entry.Output).pid")) {
+        Stop-EnumJob $Entry
+        $Entry.Stopped = $false
+    }
+    $result = @(Receive-Job -Job $Entry.Job -ErrorAction SilentlyContinue)
+    Remove-Job -Job $Entry.Job -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Path -LiteralPath $Entry.Output)) {
+        $parts = @(@("$($Entry.Output).stdout", "$($Entry.Output).stderr") |
+            Where-Object { Test-Path -LiteralPath $_ })
+        if ($parts.Count -gt 0) {
+            $destination = [IO.File]::Create($Entry.Output)
+            try {
+                foreach ($part in $parts) {
+                    $source = [IO.File]::OpenRead($part)
+                    try { $source.CopyTo($destination) } finally { $source.Dispose() }
+                }
+            } finally { $destination.Dispose() }
+            Remove-Item -LiteralPath $parts -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if ($Entry.Stopped) { return 'partial-after-proof' }
+    if ($result.Count -eq 0) { return 'partial' }
+    return [string]$result[-1]
+}
+
+function Watch-EnumOutput($Entry, [hashtable]$SeenCves) {
+    foreach ($part in @("$($Entry.Output).stdout", "$($Entry.Output).stderr")) {
+        if (-not (Test-Path -LiteralPath $part)) { continue }
+        $key = "$($Entry.Name):$part"
+        $offset = if ($script:enumOffsets.ContainsKey($key)) { [long]$script:enumOffsets[$key] } else { [long]0 }
+        try {
+            $reader = [IO.File]::Open($part, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            try {
+                if ($reader.Length -le $offset) { continue }
+                $reader.Position = [Math]::Max(0, $offset - 64)
+                $buffer = New-Object byte[] ([int]($reader.Length - $reader.Position))
+                $read = 0
+                while ($read -lt $buffer.Length) {
+                    $partRead = $reader.Read($buffer, $read, $buffer.Length - $read)
+                    if ($partRead -le 0) { break }
+                    $read += $partRead
+                }
+                if ($read -lt $buffer.Length) {
+                    $short = New-Object byte[] $read
+                    [Array]::Copy($buffer, $short, $read)
+                    $buffer = $short
+                }
+                $text = [Console]::OutputEncoding.GetString($buffer)
+                if ($script:ShowRawOutput) {
+                    $newStart = [int]([Math]::Min($buffer.Length, $offset - [Math]::Max(0, $offset - 64)))
+                    [Console]::Out.Write([Console]::OutputEncoding.GetString($buffer, $newStart, $buffer.Length - $newStart))
+                }
+                foreach ($match in [regex]::Matches($text, 'CVE-[0-9]{4}-[0-9]{4,}')) {
+                    $SeenCves[$match.Value] = $true
+                }
+                $script:enumOffsets[$key] = $reader.Position
+            } finally { $reader.Dispose() }
+        } catch [IO.IOException] { }
+    }
+}
+
+function Expand-VerifiedZip([string]$ArchivePath, [string]$Destination, [string]$ExpectedName) {
+    Set-PrivateDirectory $Destination
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        [IO.Compression.ZipFile]::ExtractToDirectory($ArchivePath, $Destination)
+    } catch {
+        # Shell.Application is available on Windows PowerShell 3 hosts with
+        # .NET 4.0, where ZipFile/Expand-Archive may not exist.
+        $shell = New-Object -ComObject Shell.Application
+        $archive = $shell.NameSpace($ArchivePath)
+        $target = $shell.NameSpace($Destination)
+        if (-not $archive -or -not $target) { throw 'ZIP extraction unavailable on this host.' }
+        $target.CopyHere($archive.Items(), 0x14)
+        for ($i = 0; $i -lt 120; $i++) {
+            $member = Get-ChildItem -LiteralPath $Destination -Filter $ExpectedName -Recurse -File -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if ($member -and $member.Length -gt 0) {
+                try {
+                    $complete = [IO.File]::Open($member.FullName, [IO.FileMode]::Open,
+                        [IO.FileAccess]::Read, [IO.FileShare]::None)
+                    $complete.Dispose()
+                    return
+                } catch [IO.IOException] { }
+            }
+            Start-Sleep -Milliseconds 250
+        }
+        throw "Expected ZIP member $ExpectedName was not extracted."
+    }
 }
 
 function Get-ReleaseAsset([string]$Repo, [string]$Asset, [string]$Destination) {
@@ -274,7 +417,7 @@ function Get-ReleaseAsset([string]$Repo, [string]$Asset, [string]$Destination) {
             }
         }
         Write-Warning "Local $Asset missing or checksum failed."
-    } else {
+    } elseif (-not $Offline) {
         try {
             $latest = Invoke-WebRequest -Uri "https://github.com/$Repo/releases/latest" -UseBasicParsing -MaximumRedirection 10 -TimeoutSec 20
             $finalUri = $latest.BaseResponse.ResponseUri.AbsoluteUri
@@ -299,6 +442,8 @@ function Get-ReleaseAsset([string]$Repo, [string]$Asset, [string]$Destination) {
             Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
             Write-Warning "Current $Asset unavailable: $($_.Exception.Message). Checking verified cache."
         }
+    } else {
+        Write-Host "[OFFLINE] Checking verified cache for $Asset."
     }
 
     if ((Test-Path -LiteralPath $cached) -and (Test-Path -LiteralPath "$cached.sha256")) {
@@ -357,21 +502,19 @@ function Get-PsExecAsset {
             Copy-Item -LiteralPath $local -Destination $destination
             $source = $local
             $release = 'local'
-        } else {
+        } elseif (-not $Offline) {
             $archivePath = Join-Path $capture 'PSTools.zip'
             Invoke-WebRequest -Uri $source -UseBasicParsing -OutFile $archivePath -TimeoutSec 180
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-            $archive = [IO.Compression.ZipFile]::OpenRead($archivePath)
-            try {
-                $entry = $archive.GetEntry('PsExec64.exe')
-                if (-not $entry) { throw 'PsExec64.exe absent from official archive' }
-                $inputStream = $entry.Open()
-                $outputStream = [IO.File]::Create($destination)
-                try { $inputStream.CopyTo($outputStream) }
-                finally { $outputStream.Dispose(); $inputStream.Dispose() }
-            } finally { $archive.Dispose() }
+            $unpack = Join-Path $capture 'psexec-unpack'
+            Expand-VerifiedZip $archivePath $unpack 'PsExec64.exe'
+            $extracted = Get-ChildItem -LiteralPath $unpack -Filter 'PsExec64.exe' -Recurse -File |
+                Select-Object -First 1
+            if (-not $extracted) { throw 'PsExec64.exe absent from official archive' }
+            Copy-Item -LiteralPath $extracted.FullName -Destination $destination
             Remove-Item -LiteralPath $archivePath -Force
             $release = (Get-Item -LiteralPath $destination).VersionInfo.FileVersion
+        } else {
+            throw 'offline mode uses only verified local or cached PsExec'
         }
         $digest = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
         if (-not (Test-PsExecAsset $destination $digest)) { throw 'PsExec Authenticode verification failed' }
@@ -521,10 +664,16 @@ Set-Content -LiteralPath '$quotedMarker' -Value `$identity.User.Value -Encoding 
 `$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 `$principal = New-Object Security.Principal.WindowsPrincipal(`$identity)
 if (-not `$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 1 }
-if ((Get-FileHash -LiteralPath '$quotedPsExec' -Algorithm SHA256).Hash -ne '$digest') { exit 1 }
+function Get-LocalSha256([string]`$path) {
+    `$stream = [IO.File]::OpenRead(`$path)
+    `$sha = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString(`$sha.ComputeHash(`$stream)).Replace('-', '') }
+    finally { `$sha.Dispose(); `$stream.Dispose() }
+}
+if ((Get-LocalSha256 '$quotedPsExec') -ne '$digest') { exit 1 }
 `$signature = Get-AuthenticodeSignature -LiteralPath '$quotedPsExec'
 if (`$signature.Status -ne 'Valid' -or `$signature.SignerCertificate.Subject -notmatch '^CN=Microsoft Corporation,') { exit 1 }
-if ((Get-FileHash -LiteralPath '$quotedPowerShell' -Algorithm SHA256).Hash -ne '$powerShellDigest') { exit 1 }
+if ((Get-LocalSha256 '$quotedPowerShell') -ne '$powerShellDigest') { exit 1 }
 `$shellArgs = @('-NoProfile')
 if ($openChildShell) { `$shellArgs += '-NoExit' }
 `$shellArgs += @('-EncodedCommand', '$encodedSystem')
@@ -672,6 +821,7 @@ foreach ($name in @('tools.tsv', 'findings.tsv', 'attempts.tsv', 'coverage.tsv')
 }
 Write-Host "[RUN] $runDir"
 if ($ToolDir) { Write-Host '[ENUM] Loading verified local assets.' }
+elseif ($Offline) { Write-Host '[OFFLINE] Using verified cached assets; release downloads are disabled.' }
 else { Write-Host '[ENUM] Fetching official current release assets.' }
 
 $winpeas = Join-Path $capture 'winPEASany.exe'
@@ -680,6 +830,12 @@ $privescCheck = Join-Path $capture 'PrivescCheck.ps1'
 $haveWinpeas = Get-ReleaseAsset 'peass-ng/PEASS-ng' 'winPEASany.exe' $winpeas
 $haveBat = Get-ReleaseAsset 'peass-ng/PEASS-ng' 'winPEAS.bat' $winpeasBat
 $havePrivescCheck = Get-ReleaseAsset 'itm4n/PrivescCheck' 'PrivescCheck.ps1' $privescCheck
+$enumJobs = @()
+$script:enumOffsets = @{}
+$liveCves = @{}
+$sharpJob = $null
+$winpeasJob = $null
+$privescJob = $null
 
 $domainJoined = $false
 $sharpCollectedZip = $null
@@ -687,15 +843,18 @@ try {
     $domainJoined = [bool](Get-CimInstance Win32_ComputerSystem).PartOfDomain
 } catch {
     # A standard user can query its computer domain even when WMI denies access.
-    try {
-        $domainJoined = [bool][System.DirectoryServices.ActiveDirectory.Domain]::GetComputerDomain()
-    } catch [System.DirectoryServices.ActiveDirectory.ActiveDirectoryObjectNotFoundException] {
-        $domainJoined = $false
-    } catch {
-        Write-Warning 'Domain join status unavailable.'
+    if ($Offline) { Write-Warning 'Domain join status unavailable locally in offline mode.' }
+    else {
+        try {
+            $domainJoined = [bool][System.DirectoryServices.ActiveDirectory.Domain]::GetComputerDomain()
+        } catch [System.DirectoryServices.ActiveDirectory.ActiveDirectoryObjectNotFoundException] {
+            $domainJoined = $false
+        } catch {
+            Write-Warning 'Domain join status unavailable.'
+        }
     }
 }
-if ($domainJoined) {
+if ($domainJoined -and -not $Offline) {
     $sharpRecorded = $false
     $latestSharp = $null
     if ($ToolDir) {
@@ -704,11 +863,26 @@ if ($domainJoined) {
         if ($sharpLocal -and $sharpLocal.Name -match '^SharpHound_(v[0-9.]+)_windows_x86\.zip$') {
             $latestSharp = $Matches[1]
         }
-    } else {
+    } elseif (-not $Offline) {
         try {
             $response = Invoke-WebRequest -Uri 'https://github.com/SpecterOps/SharpHound/releases/latest' -UseBasicParsing -TimeoutSec 20
             $latestSharp = ($response.BaseResponse.ResponseUri.AbsoluteUri -split '/')[-1]
         } catch { Write-Warning 'Could not resolve SharpHound release.' }
+    } else {
+        $sharpCache = Join-Path $cacheBase 'SpecterOps_SharpHound'
+        $cachedSharp = Get-ChildItem -LiteralPath $sharpCache -Filter 'SharpHound_v*_windows_x86.zip' -File -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending | Select-Object -First 1
+        if ($cachedSharp -and $cachedSharp.Name -match '^SharpHound_(v[0-9.]+)_windows_x86\.zip$') {
+            $latestSharp = $Matches[1]
+        }
+    }
+    if (-not $latestSharp -and $ToolDir) {
+        $sharpCache = Join-Path $cacheBase 'SpecterOps_SharpHound'
+        $cachedSharp = Get-ChildItem -LiteralPath $sharpCache -Filter 'SharpHound_v*_windows_x86.zip' -File -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending | Select-Object -First 1
+        if ($cachedSharp -and $cachedSharp.Name -match '^SharpHound_(v[0-9.]+)_windows_x86\.zip$') {
+            $latestSharp = $Matches[1]
+        }
     }
     if ($latestSharp -and $latestSharp -match '^v[0-9.]+$') {
         $sharpAsset = "SharpHound_${latestSharp}_windows_x86.zip"
@@ -716,26 +890,17 @@ if ($domainJoined) {
         if (Get-ReleaseAsset 'SpecterOps/SharpHound' $sharpAsset $sharpZip) {
             try {
                 $sharpBin = Join-Path $capture 'sharphound-bin'
-                Expand-Archive -LiteralPath $sharpZip -DestinationPath $sharpBin -Force
+                Expand-VerifiedZip $sharpZip $sharpBin 'SharpHound.exe'
                 $sharpExe = Get-ChildItem -LiteralPath $sharpBin -Filter 'SharpHound.exe' -Recurse -File | Select-Object -First 1
                 if (-not $sharpExe) { throw 'SharpHound.exe absent from release ZIP' }
                 $sharpOut = Join-Path $capture 'sharphound-data'
                 New-Item -ItemType Directory -Path $sharpOut | Out-Null
                 Write-Host '[ENUM] SharpHound Default collection.'
-                $sharpStatus = Invoke-CapturedProcess $sharpExe.FullName `
+                $sharpJob = Start-EnumJob 'sharphound' $sharpExe.FullName `
                     "--CollectionMethods Default --OutputDirectory `"$sharpOut`" --ZipFileName sharphound.zip" `
-                    (Join-Path $capture 'sharphound-output.txt') $ToolTimeoutSeconds
-                # SharpHound prefixes ZipFileName with a timestamp.
-                $sharpCollectedZip = Get-ChildItem -LiteralPath $sharpOut -Filter '*sharphound.zip' -File |
-                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
-                if ($sharpCollectedZip) {
-                    $zipStatus = if ($sharpStatus -eq 'checked') { 'checked' } else { 'partial-zip' }
-                    Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "sharphound`t$zipStatus"
-                    $sharpRecorded = $true
-                } else {
-                    Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "sharphound`tpartial-no-zip"
-                    $sharpRecorded = $true
-                }
+                    (Join-Path $capture 'sharphound-output.txt')
+                $enumJobs += $sharpJob
+                $sharpRecorded = $true
             } catch {
                 Write-Warning "SharpHound failed: $($_.Exception.Message)"
                 Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "sharphound`tfailed"
@@ -746,6 +911,8 @@ if ($domainJoined) {
     if (-not $sharpRecorded) {
         Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "sharphound`tunavailable"
     }
+} elseif ($domainJoined) {
+    Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "sharphound`tskipped-offline"
 } else {
     Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "sharphound`tnot-domain-joined"
 }
@@ -754,14 +921,98 @@ $winpeasOk = $false
 if ($haveWinpeas) {
     Write-Host '[ENUM] WinPEAS.'
     try {
-        $status = Invoke-CapturedProcess $winpeas '' (Join-Path $capture 'winpeas-output.txt') $ToolTimeoutSeconds
-        $winpeasOk = $status -eq 'checked'
-        Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "winpeas`t$status"
+        $winpeasJob = Start-EnumJob 'winpeas' $winpeas '' (Join-Path $capture 'winpeas-output.txt')
+        $enumJobs += $winpeasJob
     } catch {
         Write-Warning "WinPEAS binary failed: $($_.Exception.Message)"
     }
 }
-if (-not $winpeasOk -and $haveBat) {
+
+$privescComplete = $false
+if ($havePrivescCheck) {
+    Write-Host '[ENUM] PrivescCheck.'
+    try {
+        $quotedCheck = $privescCheck.Replace("'", "''")
+        $checkCode = ". '$quotedCheck'; Invoke-PrivescCheck -Extended -Audit"
+        $encodedCheck = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($checkCode))
+        $privescJob = Start-EnumJob 'privesccheck' 'powershell.exe' "/NoProfile /ExecutionPolicy Bypass /EncodedCommand $encodedCheck" `
+            (Join-Path $capture 'privesccheck-output.txt')
+        $enumJobs += $privescJob
+    } catch {
+        Write-Warning "PrivescCheck failed: $($_.Exception.Message)"
+        Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "privesccheck`tpartial"
+    }
+}
+
+# Native prerequisites are independent of enumerator prose, so test them as
+# soon as the background collectors start. Enumerator CVEs remain review-only.
+$fastRecipe = $null
+$fastAttemptedRecipe = $null
+$fastSuccessRecipe = $null
+$weakLabState = $null
+if (Test-SystemIdentity) { $fastRecipe = 'already-system' }
+elseif (Test-AdminIdentity) { $fastRecipe = 'already-admin' }
+elseif (Test-AdminMembership) { $fastRecipe = 'uac-admin' }
+elseif ($EnableWeakServiceLab -and (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Edamame-NG\Lab\WeakService')) {
+    $weakLabState = Get-WeakServiceLabState
+    if ($weakLabState) { $fastRecipe = 'weak-service-lab' }
+}
+if ($fastRecipe) {
+    Write-Finding 'local-elevation' "$fastRecipe independently verified while enumeration runs"
+    if ($fastRecipe -eq 'weak-service-lab') {
+        if (-not (Confirm-WeakServiceChange)) {
+            Write-Attempt $fastRecipe 'service-change-approval-declined'
+            $fastAttemptedRecipe = $fastRecipe
+            $fastRecipe = $null
+        } else { Write-Attempt $fastRecipe 'service-change-approved' }
+    }
+    if ($fastRecipe -in @('already-admin', 'uac-admin')) {
+        if (Confirm-SystemService) {
+            Write-Attempt $fastRecipe 'service-approved'
+            $psExecPath = Get-PsExecAsset
+            if ($psExecPath) {
+                $fastRecipe = if ($fastRecipe -eq 'uac-admin') { 'uac-admin-system' } else { 'admin-system' }
+            }
+        } else { Write-Attempt $fastRecipe 'service-approval-declined' }
+    }
+    if ($fastRecipe) {
+        $fastAttemptedRecipe = $fastRecipe
+        if (-not $FinishBgEnum -and -not $NoShell -and $fastRecipe -in @('already-system', 'already-admin')) {
+            foreach ($entry in $enumJobs) { Stop-EnumJob $entry }
+        }
+        if (Invoke-Recipe $fastRecipe) {
+            $fastSuccessRecipe = $fastRecipe
+            Write-Attempt $fastRecipe 'proof-success'
+            if (-not $FinishBgEnum -and -not $NoShell) {
+                foreach ($entry in $enumJobs) { Stop-EnumJob $entry }
+            }
+        } else { Write-Attempt $fastRecipe 'proof-failed' }
+    }
+}
+
+$lastLiveCount = 0
+while (@($enumJobs | Where-Object { $_.Job.State -in @('NotStarted', 'Running') }).Count -gt 0) {
+    foreach ($entry in $enumJobs) { Watch-EnumOutput $entry $liveCves }
+    if ($liveCves.Count -gt $lastLiveCount) {
+        Write-Finding 'cve-candidates' "$($liveCves.Count) suggested so far; review exact build and patch status"
+        $lastLiveCount = $liveCves.Count
+    }
+    Start-Sleep -Milliseconds 250
+}
+foreach ($entry in $enumJobs) { Watch-EnumOutput $entry $liveCves }
+
+$sharpStatus = if ($sharpJob) { Complete-EnumJob $sharpJob } else { 'unavailable' }
+if ($sharpJob) {
+    $sharpCollectedZip = Get-ChildItem -LiteralPath $sharpOut -Filter '*sharphound.zip' -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $zipStatus = if (-not $sharpCollectedZip) { 'partial-no-zip' }
+        elseif ($sharpStatus -eq 'checked') { 'checked' } else { 'partial-zip' }
+    Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "sharphound`t$zipStatus"
+}
+$winpeasStatus = if ($winpeasJob) { Complete-EnumJob $winpeasJob } else { 'unavailable' }
+$winpeasOk = $winpeasStatus -eq 'checked'
+if ($winpeasJob) { Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "winpeas`t$winpeasStatus" }
+if (-not $winpeasOk -and $haveBat -and (-not $fastSuccessRecipe -or $NoShell -or $FinishBgEnum)) {
     Write-Host '[ENUM] WinPEAS batch fallback.'
     $binaryOutput = Join-Path $capture 'winpeas-output.txt'
     if (Test-Path -LiteralPath $binaryOutput) {
@@ -780,25 +1031,9 @@ if (-not (Test-Path -LiteralPath (Join-Path $capture 'winpeas-output.txt'))) {
     $status = if (Test-Path -LiteralPath (Join-Path $capture 'winpeas-binary-partial.txt')) { 'partial' } else { 'unavailable' }
     Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "winpeas`t$status"
 }
-
-$privescComplete = $false
-if ($havePrivescCheck) {
-    Write-Host '[ENUM] PrivescCheck.'
-    try {
-        $quotedCheck = $privescCheck.Replace("'", "''")
-        $checkCode = ". '$quotedCheck'; Invoke-PrivescCheck -Extended -Audit"
-        $encodedCheck = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($checkCode))
-        $status = Invoke-CapturedProcess 'powershell.exe' "/NoProfile /ExecutionPolicy Bypass /EncodedCommand $encodedCheck" `
-            (Join-Path $capture 'privesccheck-output.txt') $ToolTimeoutSeconds
-        $privescComplete = $status -eq 'checked'
-        Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "privesccheck`t$status"
-    } catch {
-        Write-Warning "PrivescCheck failed: $($_.Exception.Message)"
-        Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "privesccheck`tpartial"
-    }
-} else {
-    Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "privesccheck`tunavailable"
-}
+$privescStatus = if ($privescJob) { Complete-EnumJob $privescJob } else { 'unavailable' }
+$privescComplete = $privescStatus -eq 'checked'
+Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "privesccheck`t$privescStatus"
 
 foreach ($entry in @(@('winpeas', 'winpeas-output.txt'), @('winpeas-binary-partial', 'winpeas-binary-partial.txt'), @('privesccheck', 'privesccheck-output.txt'))) {
     $raw = Join-Path $capture $entry[1]
@@ -807,7 +1042,7 @@ foreach ($entry in @(@('winpeas', 'winpeas-output.txt'), @('winpeas-binary-parti
         Write-Finding "$($entry[0])-screening" "$count candidate lines in raw output; values withheld from console"
     }
 }
-if ($domainJoined) {
+if ($domainJoined -and -not $Offline) {
     $sharpSummary = if ($sharpCollectedZip) { 'collection ZIP produced; contents withheld from console' }
         else { 'no collection ZIP; see coverage for completion status' }
     Write-Finding 'sharphound-screening' $sharpSummary
@@ -832,7 +1067,6 @@ try {
     }
 } catch { Write-Warning 'Service path check failed.' }
 
-$weakLabState = $null
 if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Edamame-NG\Lab\WeakService') {
     if ($EnableWeakServiceLab -and -not (Test-AdminMembership) -and -not (Test-AdminIdentity) -and -not (Test-SystemIdentity)) {
         $weakLabState = Get-WeakServiceLabState
@@ -912,6 +1146,14 @@ $suggestedCves | ForEach-Object { "$_`thttps://www.cve.org/CVERecord?id=$_" } |
     Set-Content -LiteralPath (Join-Path $runDir 'cve-candidates.tsv') -Encoding ASCII
 Write-CveIndex $CatalogDir $suggestedCves (Join-Path $runDir 'cve-index.tsv')
 Write-Host '[SAVED] findings.tsv, coverage.tsv, attempts.tsv, tools.tsv'
+
+if ($fastSuccessRecipe) {
+    $evidence = if ($fastSuccessRecipe -eq 'weak-service-lab') { $weakServiceEvidence } else { 'verified-local-proof' }
+    [pscustomobject]@{ host = $hostName; recipe = $fastSuccessRecipe; evidence = $evidence } |
+        ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $runDir 'success.json') -Encoding UTF8
+    exit 0
+}
+if ($recipe -eq $fastAttemptedRecipe) { $recipe = $null }
 
 if ($recipe) {
     if ($recipe -eq 'weak-service-lab') {

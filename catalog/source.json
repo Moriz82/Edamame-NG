@@ -1,9 +1,9 @@
 {
-  "catalog_released": "2026-09-24T19:00:55.0481Z",
-  "catalog_version": "2026.09.24",
+  "catalog_released": "2026-09-25T14:39:25.3654Z",
+  "catalog_version": "2026.09.25",
   "indexed_candidates": 118,
   "meaning": "CISA KEV local-EoP text candidates; not host vulnerability or exploit proof",
   "source": "https://github.com/cisagov/kev-data/blob/develop/known_exploited_vulnerabilities.json",
-  "source_records": 1723,
-  "source_sha256": "39099ffcf82c3f183fa6f7326900a6d82731517b2edb5cecde06dee6e04289d1"
+  "source_records": 1725,
+  "source_sha256": "168e6d6c925f80bdb7e555f6dff974c60c4143137d5fc5814c5c4958a1c2f308"
 }
