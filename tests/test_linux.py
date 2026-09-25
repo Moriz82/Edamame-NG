@@ -14,11 +14,11 @@ def write(path, body):
     path.chmod(0o755)
 
 
-def run(script, env, *args):
+def run(script, env, *args, check=True):
     return subprocess.run(
         ["bash", str(script), *args], env=env, capture_output=True, text=True,
-        timeout=30, check=True,
-    ).stdout
+        timeout=30, check=check,
+    )
 
 
 with tempfile.TemporaryDirectory(prefix="edamame-test-") as temp:
@@ -33,8 +33,8 @@ with tempfile.TemporaryDirectory(prefix="edamame-test-") as temp:
     marker = base / "enumerations"
     write(fake / "uname", "#!/bin/sh\necho Linux\n")
     write(fake / "hostname", "#!/bin/sh\necho fixture-host\n")
-    write(fake / "timeout", "#!/bin/sh\nshift\nexec \"$@\"\n")
-    write(fake / "sudo", "#!/bin/sh\nif [ \"$1\" = -n ] && [ \"$2\" = /bin/bash ]; then exit 0; fi\nexit 1\n")
+    write(fake / "timeout", "#!/bin/sh\nshift\ncase \"$*\" in *linpeas.sh*) if [ -n \"${EDAMAME_TEST_TIMEOUT_FAIL:-}\" ]; then echo 'CVE-2026-99999 partial'; exit 124; fi;; esac\nexec \"$@\"\n")
+    write(fake / "sudo", "#!/bin/sh\n[ -z \"${EDAMAME_TEST_NO_SUDO:-}\" ] || exit 1\nif [ \"$1\" = -n ] && [ \"$2\" = /bin/bash ]; then exit 0; fi\nexit 1\n")
     write(fake / "docker", "#!/bin/sh\nexit 1\n")
     write(fake / "getcap", "#!/bin/sh\nexit 1\n")
     write(fake / "find", "#!/bin/sh\nif [ \"$1\" = \"$EDAMAME_TEST_RUNS\" ]; then exec /usr/bin/find \"$@\"; fi\nexit 0\n")
@@ -70,7 +70,7 @@ else:
                EDAMAME_TEST_RUNS=str(runs), EDAMAME_TEST_ASSETS=str(tools),
                PATH=f"{fake}:{os.environ['PATH']}")
     stdout = run(ROOT / "edamame-ng.sh", env, "--scan", "--no-shell",
-                 "--output-dir", str(runs), "--tool-dir", str(tools))
+                 "--output-dir", str(runs), "--tool-dir", str(tools)).stdout
     assert "[FOUND] linpeas-screening" in stdout, stdout
     assert stdout.index("[FOUND]") < stdout.index("[SAVED] linpeas-output.txt")
     run_dir = next(runs.iterdir())
@@ -82,8 +82,30 @@ else:
     assert "sudo-shell" in (run_dir / "success.tsv").read_text()
     assert len(marker.read_text().splitlines()) == 2
     resumed = run(ROOT / "edamame-ng.sh", env, "--resume", "--no-shell",
-                  "--output-dir", str(runs))
+                  "--output-dir", str(runs)).stdout
     assert "[RESUME] sudo-shell" in resumed
+    assert len(marker.read_text().splitlines()) == 2
+    automatic = run(ROOT / "edamame-ng.sh", env, "--no-shell", "--output-dir", str(runs)).stdout
+    assert "[RESUME] sudo-shell" in automatic
+    assert len(marker.read_text().splitlines()) == 2
+    saved = run_dir / "success.tsv"
+    original = saved.read_text()
+    saved.write_text(original.replace("fixture-host", "other-host"))
+    foreign = run(ROOT / "edamame-ng.sh", env, "--resume", run_dir.name,
+                  "--output-dir", str(runs), "--no-shell", check=False)
+    assert foreign.returncode == 2 and "another host" in foreign.stderr
+    saved.write_text(original.replace("sudo-shell", "unreviewed-recipe"))
+    unknown = run(ROOT / "edamame-ng.sh", env, "--resume", run_dir.name,
+                  "--output-dir", str(runs), "--no-shell", check=False)
+    assert unknown.returncode == 2 and "Unknown saved recipe" in unknown.stderr
+    saved.write_text(original)
+    invalid = run(ROOT / "edamame-ng.sh", env, "--resume", "..",
+                  "--output-dir", str(runs), "--no-shell", check=False)
+    assert invalid.returncode == 2 and "Invalid run ID" in invalid.stderr
+    denied_env = dict(env, EDAMAME_TEST_NO_SUDO="1")
+    denied = run(ROOT / "edamame-ng.sh", denied_env, "--resume", run_dir.name,
+                 "--output-dir", str(runs), "--no-shell", check=False)
+    assert denied.returncode == 1 and "no longer works" in denied.stderr
     assert len(marker.read_text().splitlines()) == 2
     online_runs = base / "online-runs"
     run(ROOT / "edamame-ng.sh", env, "--scan", "--no-shell", "--output-dir", str(online_runs))
@@ -99,4 +121,33 @@ else:
     legacy = next(legacy_runs.iterdir())
     assert "lse.sh\tv1" in (legacy / "tools.tsv").read_text()
     assert "legacy-release-no-published-digest" in (legacy / "tools.tsv").read_text()
-    print("Linux synthetic scan, alert order, digest, legacy LSE, cache, masking, and resume passed")
+    partial_runs = base / "partial-runs"
+    partial_env = dict(env, EDAMAME_TEST_TIMEOUT_FAIL="1", EDAMAME_TEST_NO_SUDO="1")
+    partial = run(ROOT / "edamame-ng.sh", partial_env, "--scan", "--no-shell",
+                  "--output-dir", str(partial_runs), "--tool-dir", str(tools))
+    partial_dir = next(partial_runs.iterdir())
+    assert "linpeas\tpartial" in (partial_dir / "coverage.tsv").read_text()
+    assert "Situational Awareness and Initial Enumeration\tunsupported" in (
+        partial_dir / "coverage.tsv").read_text()
+    assert "CVE-2026-99999" in (partial_dir / "linpeas-output.txt").read_text()
+    assert partial.stdout.index("[FOUND]") < partial.stdout.index("[SAVED] linpeas-output.txt")
+    assert not (partial_dir / "success.tsv").exists()
+    no_success = run(ROOT / "edamame-ng.sh", partial_env, "--resume", "--no-shell",
+                     "--output-dir", str(partial_runs), check=False)
+    assert no_success.returncode == 2
+    bad_runs = base / "bad-digest-runs"
+    bad_cache = base / "fresh-cache"
+    (tools / "linpeas.sh.sha256").write_text("0" * 64 + "\n")
+    bad_env = dict(env, XDG_CACHE_HOME=str(bad_cache))
+    bad = run(ROOT / "edamame-ng.sh", bad_env, "--scan", "--no-shell",
+              "--output-dir", str(bad_runs), "--tool-dir", str(tools))
+    bad_dir = next(bad_runs.iterdir())
+    assert "linpeas.sh\tmissing" in (bad_dir / "tools.tsv").read_text()
+    assert not (bad_dir / "linpeas-output.txt").exists()
+    assert "checksum failed" in bad.stderr
+    link = base / "linked-runs"
+    link.symlink_to(runs, target_is_directory=True)
+    linked = run(ROOT / "edamame-ng.sh", env, "--scan", "--no-shell",
+                 "--output-dir", str(link), "--tool-dir", str(tools), check=False)
+    assert linked.returncode == 2 and "symbolic links" in linked.stderr
+    print("Linux scan, alert order, partial capture, digest failures, cache, masking, resume rejection, and path guards passed")

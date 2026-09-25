@@ -44,9 +44,14 @@ sha256_file() {
   fi
 }
 
-safe_name() { [[ $1 =~ ^[A-Za-z0-9._+-]+$ ]]; }
+safe_name() { [[ $1 =~ ^[A-Za-z0-9._+-]+$ && $1 != . && $1 != .. ]]; }
 host_name=$(hostname -s 2>/dev/null || hostname)
 host_name=${host_name//[^A-Za-z0-9._-]/_}
+
+if [[ -L $RUN_BASE || -L $CACHE_BASE ]]; then
+  printf 'Run and cache directories must not be symbolic links.\n' >&2
+  exit 2
+fi
 
 latest_success() {
   [[ -d $RUN_BASE ]] || return 1
@@ -82,7 +87,7 @@ if [[ $MODE == resume ]]; then
   else
     success_file=$(latest_success || true)
   fi
-  [[ -n $success_file && -f $success_file && ! -L $success_file ]] || {
+  [[ -n $success_file && -f $success_file && ! -L $success_file && ! -L ${success_file%/success.tsv} ]] || {
     printf 'No valid successful run to resume.\n' >&2; exit 2;
   }
   IFS=$'\t' read -r saved_host recipe _ < "$success_file"
@@ -94,11 +99,11 @@ if [[ $MODE == resume ]]; then
   printf '[RESUME] %s on %s; checking prerequisites again.\n' "$recipe" "$host_name"
   RUN_DIR=${success_file%/success.tsv}
 else
-  mkdir -p "$RUN_BASE" "$CACHE_BASE"
-  chmod 700 "$RUN_BASE" "$CACHE_BASE"
+  mkdir -p "$RUN_BASE" "$CACHE_BASE" || exit 2
+  chmod 700 "$RUN_BASE" "$CACHE_BASE" || exit 2
   run_id="$(date -u +%Y%m%dT%H%M%SZ)-${host_name}-$$"
   RUN_DIR="$RUN_BASE/$run_id"
-  mkdir -m 700 "$RUN_DIR" "$RUN_DIR/.capture"
+  mkdir -m 700 "$RUN_DIR" "$RUN_DIR/.capture" || exit 2
   : > "$RUN_DIR/tools.tsv"
   : > "$RUN_DIR/findings.tsv"
   : > "$RUN_DIR/attempts.tsv"
@@ -245,6 +250,7 @@ printf '[ENUM] Fetching official current release assets.\n'
 linpeas="$RUN_DIR/.capture/linpeas.sh"
 lse="$RUN_DIR/.capture/lse.sh"
 have_linpeas=0; have_lse=0
+linpeas_complete=0; lse_complete=0
 asset_from_release peass-ng/PEASS-ng linpeas.sh "$linpeas" && have_linpeas=1
 asset_from_release diego-treitos/linux-smart-enumeration lse.sh "$lse" && have_lse=1
 
@@ -252,6 +258,7 @@ if ((have_linpeas)); then
   printf '[ENUM] LinPEAS\n'
   if timeout 600 bash "$linpeas" > "$RUN_DIR/.capture/linpeas-output.txt" 2>&1; then
     printf 'linpeas\tchecked\n' >> "$RUN_DIR/coverage.tsv"
+    linpeas_complete=1
   else
     printf 'linpeas\tpartial\n' >> "$RUN_DIR/coverage.tsv"
   fi
@@ -262,6 +269,7 @@ if ((have_lse)); then
   printf '[ENUM] LSE\n'
   if timeout 600 bash "$lse" -i -l2 -c > "$RUN_DIR/.capture/lse-output.txt" 2>&1; then
     printf 'lse\tchecked\n' >> "$RUN_DIR/coverage.tsv"
+    lse_complete=1
   else
     printf 'lse\tpartial\n' >> "$RUN_DIR/coverage.tsv"
   fi
@@ -306,7 +314,7 @@ for candidate in already-root sudo-shell suid-bash python-cap-setuid docker-host
   record_attempt "$candidate" prerequisite-not-met
 done
 enum_status=unsupported
-if ((have_linpeas || have_lse)); then enum_status=checked; fi
+if ((linpeas_complete && lse_complete)); then enum_status=checked; fi
 while IFS='|' read -r area basis; do
   [[ -n $area ]] && printf '%s\t%s\t%s\n' "$area" "$enum_status" "$basis" >> "$RUN_DIR/coverage.tsv"
 done <<'EOF'

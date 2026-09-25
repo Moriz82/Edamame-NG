@@ -7,7 +7,7 @@ param(
     [Parameter(ParameterSetName = 'Resume')][string]$RunId,
     [string]$OutputDir = (Join-Path $env:LOCALAPPDATA 'Edamame-NG\runs'),
     [string]$ToolDir,
-    [ValidateRange(15, 3600)][int]$ToolTimeoutSeconds = 600,
+    [ValidateRange(15, 3600)][int]$ToolTimeoutSeconds = 300,
     [switch]$NoShell
 )
 
@@ -20,9 +20,31 @@ function Set-PrivateDirectory([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) {
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
     }
-    $principal = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    & icacls.exe $Path '/inheritance:r' '/grant:r' "${principal}:(OI)(CI)F" *> $null
-    if ($LASTEXITCODE -ne 0) { throw "Could not restrict directory ACL: $Path" }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Output path must be a regular directory: $Path"
+    }
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    # Build a DACL-only descriptor. Reusing Get-Acl can carry a SACL whose
+    # write requires SeSecurityPrivilege from ordinary users.
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $none = [System.Security.AccessControl.PropagationFlags]::None
+    $allow = [System.Security.AccessControl.AccessControlType]::Allow
+    $full = [System.Security.AccessControl.FileSystemRights]::FullControl
+    foreach ($sid in @($identity, ([System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')))) {
+        $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid, $full, $inherit, $none, $allow))
+    }
+    $item.SetAccessControl($acl)
+    $allowed = @($identity.Value, 'S-1-5-18')
+    $verified = Get-Acl -LiteralPath $Path
+    foreach ($rule in $verified.Access) {
+        $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        if ($rule.AccessControlType -eq $allow -and $sid -notin $allowed) {
+            throw "Could not restrict directory ACL: $Path"
+        }
+    }
 }
 
 function Get-LatestSuccess {
@@ -31,7 +53,14 @@ function Get-LatestSuccess {
         Sort-Object Name -Descending |
         ForEach-Object {
             $candidate = Join-Path $_.FullName 'success.json'
-            if (Test-Path -LiteralPath $candidate) { return $candidate }
+            if (Test-Path -LiteralPath $candidate) {
+                try {
+                    $saved = Get-Content -LiteralPath $candidate -Raw | ConvertFrom-Json
+                    if ($saved.host -eq $hostName -and $saved.recipe -in @('already-system', 'already-admin', 'uac-admin')) {
+                        return $candidate
+                    }
+                } catch { }
+            }
         } | Select-Object -First 1
 }
 
@@ -233,11 +262,14 @@ if (-not $Scan -and -not $Resume) {
 
 if ($Resume) {
     if ($RunId) {
-        if ($RunId -notmatch '^[A-Za-z0-9._-]+$') { throw 'Invalid run ID' }
+        if ($RunId -in @('.', '..') -or $RunId -notmatch '^[A-Za-z0-9._-]+$') { throw 'Invalid run ID' }
         $prior = Join-Path (Join-Path $OutputDir $RunId) 'success.json'
     }
     if (-not $prior -or -not (Test-Path -LiteralPath $prior)) { throw 'No successful run to resume' }
     $runDir = Split-Path -Parent $prior
+    Set-PrivateDirectory $OutputDir
+    Set-PrivateDirectory $runDir
+    Set-PrivateDirectory (Join-Path $runDir '.capture')
     $saved = Get-Content -LiteralPath $prior -Raw | ConvertFrom-Json
     if ($saved.host -ne $hostName -or $saved.recipe -notin @('already-system', 'already-admin', 'uac-admin')) {
         throw 'Saved run has an invalid host or recipe'
@@ -439,7 +471,7 @@ if (Test-SystemIdentity) {
     $recipe = 'uac-admin'
     Write-Finding 'local-elevation' 'Administrator membership detected; UAC elevation available'
 }
-$enumStatus = if ($winpeasOk -or $privescComplete) { 'checked' } else { 'unsupported' }
+$enumStatus = if ($winpeasOk -and $privescComplete) { 'checked' } else { 'unsupported' }
 foreach ($area in @(
     'Situational Awareness and Initial Enumeration', 'WiFi & Network Enumeration',
     'Processes & Tasks', 'BIOS & Hardware Information', 'Sensitive Information & Passwords',
