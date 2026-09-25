@@ -8,6 +8,7 @@ Linux (Bash, `curl`, `timeout`, `sha256sum` or `shasum`):
 
 ```sh
 bash edamame-ng.sh --scan --output-dir "$HOME/edamame-ng-runs"
+bash edamame-ng.sh --scan --verbose --output-dir "$HOME/edamame-ng-runs"
 bash edamame-ng.sh --resume --output-dir "$HOME/edamame-ng-runs"
 ```
 
@@ -15,6 +16,7 @@ Windows (Windows PowerShell 5.1 or later):
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Edamame-NG.ps1 -Scan
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Edamame-NG.ps1 -Scan -Verbose
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Edamame-NG.ps1 -Resume
 ```
 
@@ -56,7 +58,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Edamame-NG.ps1 -Poc CV
 
 The older LSE release does not publish a SHA-256 in GitHub's release listing. For that asset, Edamame-NG prints a warning, hashes the official HTTPS download, and uses that hash to check later cached copies. This is a recorded digest, not independent upstream checksum validation. Windows has `-ToolTimeoutSeconds` (default 300) to retain partial output when an external enumerator stalls; Linux uses 600 seconds for each enumerator.
 
-The run directory is private (mode 700 on Linux; an explicit current-user and SYSTEM ACL on Windows). Raw enumerator output can contain credentials. Each enumerator writes to `.capture` first. Console alerts contain counts and verified paths, never credential values. Only after the alerts are printed does the script move raw output to `linpeas-output.txt`, `lse-output.txt`, `winpeas-output.txt`, `privesccheck-output.txt`, and, when applicable, `sharphound.zip`. Inspect the run directory locally and handle it as sensitive evidence.
+Scan and Resume show a startup splash. `--verbose` (or `-v`) on Linux and PowerShell's `-Verbose` show raw enumerator output live during Scan, with a warning because that output may contain credentials. Resume skips enumeration, and CVE/PoC queries remain machine readable without a splash. The default console alerts continue to withhold credential values.
+
+The run directory is private (mode 700 on Linux; an explicit current-user and SYSTEM ACL on Windows). Raw enumerator output can contain credentials. Each enumerator writes to `.capture` first. Only after the alerts are printed does the script move raw output to `linpeas-output.txt`, `lse-output.txt`, `winpeas-output.txt`, `privesccheck-output.txt`, and, when applicable, `sharphound.zip`. Inspect the run directory locally and handle it as sensitive evidence.
 
 `tools.tsv` records release tag, source, and SHA-256. `findings.tsv`, `attempts.tsv`, `coverage.tsv`, `cve-candidates.tsv`, and `cve-index.tsv` provide the decision record. A successful recipe is recorded by ID and evidence in `success.tsv` or `success.json`. Resume checks its prerequisites again and skips enumeration.
 
@@ -101,6 +105,7 @@ python3 tests/test_linux.py
 python3 tests/test_catalog.py
 pwsh -NoProfile -File tests/test_release.ps1
 pwsh -NoProfile -File tests/test_windows_catalog.ps1
+pwsh -NoProfile -File tests/test_capture_verbose.ps1
 ```
 
 On a disposable Windows guest, `tests/test_psexec.ps1 -ArchivePath <verified-PSTools.zip>` checks official archive extraction, Authenticode, SHA-256, verified-cache fallback, and tamper rejection without contacting the network. It requires the current official ZIP as an external fixture.
@@ -111,6 +116,6 @@ The PowerShell release test parses `Edamame-NG.ps1` and checks local and release
 
 `tests/integration_suid_find.sh` repeats the SUID `find` Scan/Resume checks with fake offline enumerators. Run it only as root inside an explicitly disposable **unprivileged LXC** guest with `EDAMAME_DISPOSABLE_LXC=1`; it refuses other environments with exit 77, restores `/usr/bin/find` ownership and mode, and deletes its temporary outputs.
 
-isolated Proxmox acceptance uses disposable, snapshot-restorable guests. Keep non-test guests and other test guests unchanged. Test fresh clones on isolated bridges, verify an elevated shell and Resume, then delete the clones. See [acceptance-2026-09-25.md](docs/acceptance-2026-09-25.md), the first [test matrix](docs/matrix-2026-09-25.md), [extended acceptance](docs/extended-acceptance-2026-09-25.md), [workgroup acceptance](docs/workgroup-acceptance-2026-09-25.md), [CVE-2025-32463 acceptance](docs/cve-2025-32463-acceptance-2026-09-25.md), [Windows 5.1 catalog acceptance](docs/windows-5.1-catalog-acceptance-2026-09-25.md), the [additional distribution matrix](docs/additional-matrix-2026-09-25.md), [SUID find acceptance](docs/suid-find-acceptance-2026-09-25.md), [Windows UAC to SYSTEM acceptance](docs/windows-uac-system-acceptance-2026-09-25.md), [Windows weak-service acceptance](docs/windows-weak-service-acceptance-2026-09-25.md), and [Windows 11 client acceptance](docs/windows11-client-acceptance-2026-09-25.md) for observed results and gaps. General Windows weak-service exploitation remains unsupported outside the exact lab fixture.
+Isolated Proxmox acceptance uses disposable, snapshot-restorable guests. Keep non-test guests and other test guests unchanged. Test fresh clones on isolated bridges, verify an elevated shell and Resume, then delete the clones. The public proof records anonymize the hypervisor name, internal domains, bridge names, and host segments of run IDs; test results and screenshots remain. See [acceptance-2026-09-25.md](docs/acceptance-2026-09-25.md), the first [test matrix](docs/matrix-2026-09-25.md), [extended acceptance](docs/extended-acceptance-2026-09-25.md), [workgroup acceptance](docs/workgroup-acceptance-2026-09-25.md), [CVE-2025-32463 acceptance](docs/cve-2025-32463-acceptance-2026-09-25.md), [Windows 5.1 catalog acceptance](docs/windows-5.1-catalog-acceptance-2026-09-25.md), the [additional distribution matrix](docs/additional-matrix-2026-09-25.md), [SUID find acceptance](docs/suid-find-acceptance-2026-09-25.md), [Windows UAC to SYSTEM acceptance](docs/windows-uac-system-acceptance-2026-09-25.md), [Windows weak-service acceptance](docs/windows-weak-service-acceptance-2026-09-25.md), and [Windows 11 client acceptance](docs/windows11-client-acceptance-2026-09-25.md) for observed results and gaps. General Windows weak-service exploitation remains unsupported outside the exact lab fixture.
 
 The [Windows Server 2025 acceptance](docs/windows-server-2025-acceptance-2026-09-25.md) covers a standard-user workgroup scan, the fixed weak-service proof and Resume, a new isolated domain controller, SharpHound Default, complete executable WinPEAS and PrivescCheck runs, and an interactive domain Administrator to SYSTEM shell.

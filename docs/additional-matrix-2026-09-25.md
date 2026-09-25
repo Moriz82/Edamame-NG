@@ -1,6 +1,6 @@
 # Additional isolated guest matrix — 2026-09-25
 
-Three unprivileged Linux containers ran on the disposable `lab-net-05` bridge on `lab-hypervisor`. The bridge had `an isolated private subnet` and no uplink or default route. The containers had only bridge-local addresses. No production VM, source VM, or current assessment target was used. Raw enumerator output and credentials are excluded from this record.
+Three unprivileged Linux containers ran on the disposable `lab-net-05` bridge on `lab-hypervisor`. The bridge used an isolated private subnet and had no uplink or default route. The containers had only bridge-local addresses. No production VM, source VM, or current assessment target was used. Raw enumerator output and credentials are excluded from this record.
 
 The [Proxmox template mirror](https://download.proxmox.com/images/system/) supplied the templates; Proxmox reported a verified checksum on download. Calculated SHA-256 values of the downloaded archives were:
 
@@ -32,4 +32,4 @@ The remaining coverage limits are the same as in the main README: unsupported ch
 
 ## Cleanup readback
 
-CTs 1700–1702 and VM 1703 were stopped and destroyed. Their configurations and ZFS volumes were absent on readback. The temporary bridge, bridge-local server, guest staging, local transfer archive, and three downloaded templates were removed. Source guest remained stopped. non-test guests and other test guests remained running, and `labpool` was `ONLINE`.
+CTs 1700–1702 and VM 1703 were stopped and destroyed. Their configurations and ZFS volumes were absent on readback. The temporary bridge, bridge-local server, guest staging, local transfer archive, and three downloaded templates were removed. Source guest remained stopped. Non-test guests and other test guests remained running, and `labpool` was `ONLINE`.

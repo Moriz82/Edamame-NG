@@ -14,6 +14,7 @@ TOOL_DIR=''
 MODE='auto'
 RESUME_ID=''
 NO_SHELL=0
+VERBOSE=0
 CATALOG_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/catalog"
 CVE_QUERY=''
 POC_QUERY=0
@@ -25,7 +26,7 @@ CVE_POC_SHA='9826979c7a3cb1ca582862768d74245806051db5601c7b6a7e13bde93b8052d7'
 usage() {
   cat <<'EOF'
 Usage: edamame-ng.sh [--scan | --resume [RUN_ID]] [--output-dir DIR]
-                      [--tool-dir DIR] [--catalog-dir DIR] [--no-shell]
+                      [--tool-dir DIR] [--catalog-dir DIR] [--verbose] [--no-shell]
                       [--enable-cve-2025-32463-lab]
        edamame-ng.sh --cve CVE-YYYY-NNNN [--catalog-dir DIR]
        edamame-ng.sh --poc CVE-YYYY-NNNN [--catalog-dir DIR]
@@ -45,6 +46,7 @@ while (($#)); do
     --poc) (($# >= 2)) || { usage >&2; exit 2; }; CVE_QUERY=$2; POC_QUERY=1; shift 2 ;;
     --enable-cve-2025-32463-lab) LAB_CVE_ENABLED=1; shift ;;
     --no-shell) NO_SHELL=1; shift ;;
+    -v|--verbose) VERBOSE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
   esac
@@ -116,6 +118,15 @@ if [[ -n $CVE_QUERY ]]; then
   exit 0
 fi
 
+cat <<'EOF'
+   _____    _                                   _   _  _____
+  | ____|__| | __ _ _ __ ___   __ _ _ __ ___   | \ | |/ ____|
+  |  _| / _` |/ _` | '_ ` _ \ / _` | '_ ` _ \  |  \| | |  __
+  | |__| (_| | (_| | | | | | | (_| | | | | | | | |\  | |__| |
+  |_____\__,_|\__,_|_| |_| |_|\__,_|_| |_| |_| |_| \_|\_____|
+                      Edamame-NG  /  Linux
+EOF
+
 safe_name() { [[ $1 =~ ^[A-Za-z0-9._+-]+$ && $1 != . && $1 != .. ]]; }
 host_name=$(hostname -s 2>/dev/null || hostname)
 host_name=${host_name//[^A-Za-z0-9._-]/_}
@@ -149,6 +160,10 @@ if [[ $MODE == auto ]]; then
   else
     MODE=scan
   fi
+fi
+
+if ((VERBOSE)) && [[ $MODE == scan ]]; then
+  printf '[WARN] Verbose displays raw enumerator output, including possible credentials, on this console.\n' >&2
 fi
 
 success_file=''
@@ -359,9 +374,19 @@ linpeas_complete=0; lse_complete=0
 asset_from_release peass-ng/PEASS-ng linpeas.sh "$linpeas" && have_linpeas=1
 asset_from_release diego-treitos/linux-smart-enumeration lse.sh "$lse" && have_lse=1
 
+run_enumerator() {
+  local output=$1
+  shift
+  if ((VERBOSE)); then
+    timeout 600 "$@" 2>&1 | tee "$output"
+  else
+    timeout 600 "$@" > "$output" 2>&1
+  fi
+}
+
 if ((have_linpeas)); then
   printf '[ENUM] LinPEAS\n'
-  if timeout 600 bash "$linpeas" > "$RUN_DIR/.capture/linpeas-output.txt" 2>&1; then
+  if run_enumerator "$RUN_DIR/.capture/linpeas-output.txt" bash "$linpeas"; then
     printf 'linpeas\tchecked\n' >> "$RUN_DIR/coverage.tsv"
     linpeas_complete=1
   else
@@ -372,7 +397,7 @@ else
 fi
 if ((have_lse)); then
   printf '[ENUM] LSE\n'
-  if timeout 600 bash "$lse" -i -l2 -c > "$RUN_DIR/.capture/lse-output.txt" 2>&1; then
+  if run_enumerator "$RUN_DIR/.capture/lse-output.txt" bash "$lse" -i -l2 -c; then
     printf 'lse\tchecked\n' >> "$RUN_DIR/coverage.tsv"
     lse_complete=1
   else

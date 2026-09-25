@@ -100,6 +100,16 @@ if ($Cve) {
     return
 }
 
+@'
+   _____    _                                   _   _  _____
+  | ____|__| | __ _ _ __ ___   __ _ _ __ ___   | \ | |/ ____|
+  |  _| / _` |/ _` | '_ ` _ \ / _` | '_ ` _ \  |  \| | |  __
+  | |__| (_| | (_| | | | | | | (_| | | | | | | | |\  | |__| |
+  |_____\__,_|\__,_|_| |_| |_|\__,_|_| |_| |_| |_| \_|\_____|
+                     Edamame-NG  /  Windows
+'@ | Write-Host
+$script:ShowRawOutput = $VerbosePreference -eq 'Continue'
+
 if ($EnableWeakServiceLab) { . (Join-Path $PSScriptRoot 'lib\WeakServiceLab.ps1') }
 
 function Set-PrivateDirectory([string]$Path) {
@@ -161,6 +171,22 @@ function Write-Finding([string]$Category, [string]$Detail) {
     Write-Host "[FOUND] ${Category}: $Detail"
 }
 
+function Write-CapturedTail([string[]]$Paths, [long[]]$Offsets, [Text.Decoder[]]$Decoders) {
+    $bytes = New-Object byte[] 8192
+    $chars = New-Object char[] ([Console]::OutputEncoding.GetMaxCharCount($bytes.Length))
+    for ($i = 0; $i -lt $Paths.Count; $i++) {
+        $reader = [IO.File]::Open($Paths[$i], [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try {
+            $reader.Position = $Offsets[$i]
+            while (($read = $reader.Read($bytes, 0, $bytes.Length)) -gt 0) {
+                $count = $Decoders[$i].GetChars($bytes, 0, $read, $chars, 0, $false)
+                [Console]::Out.Write($chars, 0, $count)
+            }
+            $Offsets[$i] = $reader.Position
+        } finally { $reader.Dispose() }
+    }
+}
+
 function Invoke-CapturedProcess([string]$FilePath, [string]$Arguments, [string]$OutputPath, [int]$TimeoutSeconds) {
     $stdout = "$OutputPath.stdout"
     $stderr = "$OutputPath.stderr"
@@ -173,12 +199,25 @@ function Invoke-CapturedProcess([string]$FilePath, [string]$Arguments, [string]$
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $process = [Diagnostics.Process]::Start($startInfo)
-    $outStream = [IO.File]::Create($stdout)
-    $errStream = [IO.File]::Create($stderr)
+    $outStream = [IO.FileStream]::new($stdout, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite, 1, [IO.FileOptions]::Asynchronous)
+    $errStream = [IO.FileStream]::new($stderr, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite, 1, [IO.FileOptions]::Asynchronous)
     try {
         $outCopy = $process.StandardOutput.BaseStream.CopyToAsync($outStream)
         $errCopy = $process.StandardError.BaseStream.CopyToAsync($errStream)
-        $finished = $process.WaitForExit($TimeoutSeconds * 1000)
+        if ($script:ShowRawOutput) {
+            $paths = @($stdout, $stderr)
+            $offsets = [long[]]@(0, 0)
+            $encoding = [Console]::OutputEncoding
+            $decoders = [Text.Decoder[]]@($encoding.GetDecoder(), $encoding.GetDecoder())
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            do {
+                $remaining = $TimeoutSeconds * 1000 - [int]$watch.ElapsedMilliseconds
+                $finished = $process.WaitForExit([Math]::Min(200, [Math]::Max(1, $remaining)))
+                Write-CapturedTail $paths $offsets $decoders
+            } while (-not $finished -and $watch.ElapsedMilliseconds -lt $TimeoutSeconds * 1000)
+        } else {
+            $finished = $process.WaitForExit($TimeoutSeconds * 1000)
+        }
         if (-not $finished) {
             try { & taskkill.exe /PID $process.Id /T /F *> $null } catch { }
             if (-not $process.HasExited) { $process.Kill() }
@@ -187,6 +226,11 @@ function Invoke-CapturedProcess([string]$FilePath, [string]$Arguments, [string]$
         }
         foreach ($copy in @($outCopy, $errCopy)) {
             try { [void]$copy.Wait(5000) } catch { }
+        }
+        if ($script:ShowRawOutput) {
+            $outStream.Flush()
+            $errStream.Flush()
+            Write-CapturedTail $paths $offsets $decoders
         }
         $exitCode = if ($finished) { $process.ExitCode } else { -1 }
     } finally {
@@ -544,6 +588,9 @@ if (-not $Scan -and -not $Resume) {
             $Resume = $true
         }
     } else { $Scan = $true }
+}
+if ($script:ShowRawOutput -and $Scan) {
+    Write-Warning 'Verbose displays raw enumerator output, including possible credentials, on this console.'
 }
 
 if ($Resume) {

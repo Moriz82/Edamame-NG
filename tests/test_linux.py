@@ -73,11 +73,22 @@ else:
                PATH=f"{fake}:{os.environ['PATH']}")
     stdout = run(ROOT / "edamame-ng.sh", env, "--scan", "--no-shell",
                  "--output-dir", str(runs), "--tool-dir", str(tools)).stdout
+    assert "Edamame-NG  /  Linux" in stdout
     assert "[FOUND] linpeas-screening" in stdout, stdout
     assert stdout.index("[FOUND]") < stdout.index("[SAVED] linpeas-output.txt")
     run_dir = next(runs.iterdir())
     assert (run_dir / "linpeas-output.txt").read_text().find("keep-private") >= 0
     assert "keep-private" not in stdout
+    verbose_runs = base / "verbose-runs"
+    verbose = run(ROOT / "edamame-ng.sh", env, "--scan", "--verbose", "--no-shell",
+                  "--output-dir", str(verbose_runs), "--tool-dir", str(tools))
+    verbose_dir = next(verbose_runs.iterdir())
+    assert "password=keep-private" in verbose.stdout
+    assert "including possible credentials" in verbose.stderr
+    assert verbose.stdout.index("password=keep-private") < verbose.stdout.index("[FOUND]")
+    assert verbose.stdout.index("[FOUND]") < verbose.stdout.index("[SAVED] linpeas-output.txt")
+    assert "password=keep-private" in (verbose_dir / "linpeas-output.txt").read_text()
+    assert "linpeas\tchecked" in (verbose_dir / "coverage.tsv").read_text()
     assert (run_dir / "lse-output.txt").is_file()
     assert "CVE-2026-12345\thttps://www.cve.org/CVERecord?id=CVE-2026-12345" in (
         run_dir / "cve-candidates.tsv").read_text()
@@ -89,14 +100,17 @@ else:
     assert "CVE-2025-32463 tested lab build\tunsupported\texplicit lab opt-in not supplied" in (
         run_dir / "coverage.tsv").read_text()
     assert "cve-2025-32463-lab" not in (run_dir / "attempts.tsv").read_text()
-    assert len(marker.read_text().splitlines()) == 2
+    assert len(marker.read_text().splitlines()) == 4
     resumed = run(ROOT / "edamame-ng.sh", env, "--resume", "--no-shell",
                   "--output-dir", str(runs)).stdout
+    assert "Edamame-NG  /  Linux" in resumed
     assert "[RESUME] sudo-shell" in resumed
-    assert len(marker.read_text().splitlines()) == 2
+    assert len(marker.read_text().splitlines()) == 4
+    query = run(ROOT / "edamame-ng.sh", env, "--cve", "CVE-2025-32463").stdout
+    assert "Edamame-NG  /  Linux" not in query
     automatic = run(ROOT / "edamame-ng.sh", env, "--no-shell", "--output-dir", str(runs)).stdout
     assert "[RESUME] sudo-shell" in automatic
-    assert len(marker.read_text().splitlines()) == 2
+    assert len(marker.read_text().splitlines()) == 4
     saved = run_dir / "success.tsv"
     original = saved.read_text()
     saved.write_text(original.replace("fixture-host", "other-host"))
@@ -123,7 +137,7 @@ else:
     denied = run(ROOT / "edamame-ng.sh", denied_env, "--resume", run_dir.name,
                  "--output-dir", str(runs), "--no-shell", check=False)
     assert denied.returncode == 1 and "no longer works" in denied.stderr
-    assert len(marker.read_text().splitlines()) == 2
+    assert len(marker.read_text().splitlines()) == 4
     duplicate_catalog = base / "duplicate-catalog"
     shutil.copytree(ROOT / "catalog", duplicate_catalog)
     with (duplicate_catalog / "curated-eop.tsv").open("a") as supplement:
@@ -166,6 +180,12 @@ else:
     assert "CVE-2026-99999" in (partial_dir / "linpeas-output.txt").read_text()
     assert partial.stdout.index("[FOUND]") < partial.stdout.index("[SAVED] linpeas-output.txt")
     assert not (partial_dir / "success.tsv").exists()
+    verbose_partial_runs = base / "verbose-partial-runs"
+    verbose_partial = run(ROOT / "edamame-ng.sh", partial_env, "--scan", "-v", "--no-shell",
+                          "--output-dir", str(verbose_partial_runs), "--tool-dir", str(tools))
+    verbose_partial_dir = next(verbose_partial_runs.iterdir())
+    assert "CVE-2026-99999 partial" in verbose_partial.stdout
+    assert "linpeas\tpartial" in (verbose_partial_dir / "coverage.tsv").read_text()
     no_success = run(ROOT / "edamame-ng.sh", partial_env, "--resume", "--no-shell",
                      "--output-dir", str(partial_runs), check=False)
     assert no_success.returncode == 2
