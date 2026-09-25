@@ -496,12 +496,17 @@ if ($havePrivescCheck) {
     Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "privesccheck`tunavailable"
 }
 
-foreach ($entry in @(@('winpeas', 'winpeas-output.txt'), @('privesccheck', 'privesccheck-output.txt'))) {
+foreach ($entry in @(@('winpeas', 'winpeas-output.txt'), @('winpeas-binary-partial', 'winpeas-binary-partial.txt'), @('privesccheck', 'privesccheck-output.txt'))) {
     $raw = Join-Path $capture $entry[1]
     if (Test-Path -LiteralPath $raw) {
         $count = @(Select-String -LiteralPath $raw -Pattern 'writ(e|able)|password|credential|service|impersonate|CVE-' -AllMatches).Count
         Write-Finding "$($entry[0])-screening" "$count candidate lines in raw output; values withheld from console"
     }
+}
+if ($domainJoined) {
+    $sharpSummary = if ($sharpCollectedZip) { 'collection ZIP produced; contents withheld from console' }
+        else { 'no collection ZIP; see coverage for completion status' }
+    Write-Finding 'sharphound-screening' $sharpSummary
 }
 
 Write-Host '[ENUM] Verifying local escalation paths.'
@@ -564,7 +569,6 @@ foreach ($area in @('Active Directory', 'Initial Enumeration', 'BloodHound')) {
 }
 foreach ($area in @(
     'Enumerating DACLs with BloodyAD', 'Credential Hunting', 'POISONING Attacks',
-    'BE VERY CAREFUL WHEN LAUNCHING THESE. DO NOT RUN FOR MORE THAN ~5 MINUTES AT A TIME, ALWAYS RUN IN ANALYZE MODE FIRST. CHECK WITH THE TEAM CAPTAIN ON THE COMMAND BEFORE EXECUTION SINCE THESE CAN POTENTIALLY BE DISTRUPTIVE IN SENSITIVE NETWORKS.',
     'EXCHANGE', 'SCCM', 'ONCE YOU GET DA', 'Things to check for', 'Other Attacks',
     'GPOs, Domain Auditing', 'Credential validation', 'Local CVE exploitation',
     'Standard-user SYSTEM recipe')) {
