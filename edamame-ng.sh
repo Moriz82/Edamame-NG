@@ -50,6 +50,8 @@ while (($#)); do
   esac
 done
 CVE_POC="$CATALOG_DIR/pocs/CVE-2025-32463/sudo-chwoot.sh"
+CVE_CURATED="$CATALOG_DIR/curated-eop.tsv"
+[[ -f $CVE_CURATED ]] || CVE_CURATED=/dev/null
 
 sha256_file() {
   local binary line digest
@@ -109,7 +111,7 @@ if [[ -n $CVE_QUERY ]]; then
   else
     [[ -f $CATALOG_DIR/local-eop.tsv ]] || { printf 'Offline catalog unavailable.\n' >&2; exit 2; }
     printf 'cve\tstatus\tplatform\tproduct\tkev_date\treference\n'
-    awk -F '\t' -v id="$CVE_QUERY" 'NR>1 && $1==id {print $1 "\tindexed-review-only\t" $2 "\t" $3 "\t" $4 "\t" $5; found=1} END {if (!found) print id "\tunindexed\t\t\t\thttps://www.cve.org/CVERecord?id=" id}' "$CATALOG_DIR/local-eop.tsv"
+    awk -F '\t' -v id="$CVE_QUERY" 'FNR>1 && $1==id {print $1 "\tindexed-review-only\t" $2 "\t" $3 "\t" $4 "\t" $5; found=1; exit} END {if (!found) print id "\tunindexed\t\t\t\thttps://www.cve.org/CVERecord?id=" id}' "$CATALOG_DIR/local-eop.tsv" "$CVE_CURATED"
   fi
   exit 0
 fi
@@ -467,9 +469,9 @@ while IFS= read -r cve; do
 done < "$cve_tmp" > "$RUN_DIR/cve-candidates.tsv"
 printf 'cve\tstatus\tplatform\tproduct\tkev_date\treference\n' > "$RUN_DIR/cve-index.tsv"
 if [[ -f $CATALOG_DIR/local-eop.tsv ]]; then
-  awk -F '\t' 'NR==FNR {if (FNR>1) {record[$1]=$0; platform[$1]=$2}; next}
+  awk -F '\t' 'FILENAME==ARGV[1] || FILENAME==ARGV[2] {if (FNR>1 && !($1 in record)) {record[$1]=$0; platform[$1]=$2}; next}
     NF {if ($1 in record) {split(record[$1], fields, "\t"); status=(platform[$1]=="linux" ? "indexed-review-only" : "platform-mismatch"); print $1 "\t" status "\t" fields[2] "\t" fields[3] "\t" fields[4] "\t" fields[5]}
-    else print $1 "\tunindexed\t\t\t\thttps://www.cve.org/CVERecord?id=" $1}' "$CATALOG_DIR/local-eop.tsv" "$cve_tmp" >> "$RUN_DIR/cve-index.tsv"
+    else print $1 "\tunindexed\t\t\t\thttps://www.cve.org/CVERecord?id=" $1}' "$CATALOG_DIR/local-eop.tsv" "$CVE_CURATED" "$cve_tmp" >> "$RUN_DIR/cve-index.tsv"
 else
   printf '[WARN] Offline CVE catalog unavailable; retaining CVE.org links.\n' >&2
   awk '{print $1 "\tunindexed\t\t\t\thttps://www.cve.org/CVERecord?id=" $1}' "$cve_tmp" >> "$RUN_DIR/cve-index.tsv"

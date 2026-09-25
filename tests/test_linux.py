@@ -3,6 +3,7 @@
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 
@@ -58,7 +59,7 @@ else:
     sys.exit(22)
 """)
     for name, output in (
-        ("linpeas.sh", "CVE-2026-12345\nCVE-2025-32463\npassword=keep-private\n"),
+        ("linpeas.sh", "CVE-2026-12345\nCVE-2025-32463\nCVE-2023-4911\npassword=keep-private\n"),
         ("lse.sh", "writable test location\n"),
     ):
         asset = tools / name
@@ -82,6 +83,7 @@ else:
     index = (run_dir / "cve-index.tsv").read_text()
     assert "CVE-2026-12345\tunindexed" in index
     assert "CVE-2025-32463\tindexed-review-only\tlinux" in index
+    assert "CVE-2023-4911\tindexed-review-only\tlinux\tglibc" in index
     assert "sudo-shell" in (run_dir / "success.tsv").read_text()
     assert "CVE-2025-32463 tested lab build\tunsupported\texplicit lab opt-in not supplied" in (
         run_dir / "coverage.tsv").read_text()
@@ -121,6 +123,16 @@ else:
                  "--output-dir", str(runs), "--no-shell", check=False)
     assert denied.returncode == 1 and "no longer works" in denied.stderr
     assert len(marker.read_text().splitlines()) == 2
+    duplicate_catalog = base / "duplicate-catalog"
+    shutil.copytree(ROOT / "catalog", duplicate_catalog)
+    with (duplicate_catalog / "curated-eop.tsv").open("a") as supplement:
+        supplement.write("CVE-2025-32463\twindows\tincorrect-duplicate\t\thttps://example.invalid/\n")
+    duplicate_runs = base / "duplicate-runs"
+    run(ROOT / "edamame-ng.sh", env, "--scan", "--no-shell",
+        "--output-dir", str(duplicate_runs), "--tool-dir", str(tools),
+        "--catalog-dir", str(duplicate_catalog))
+    duplicate_index = (next(duplicate_runs.iterdir()) / "cve-index.tsv").read_text()
+    assert "CVE-2025-32463\tindexed-review-only\tlinux\tSudo" in duplicate_index
     lab_runs = base / "lab-runs"
     run(ROOT / "edamame-ng.sh", denied_env, "--scan", "--no-shell",
         "--enable-cve-2025-32463-lab", "--output-dir", str(lab_runs),

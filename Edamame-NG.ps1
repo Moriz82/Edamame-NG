@@ -21,16 +21,23 @@ $cacheBase = Join-Path $env:LOCALAPPDATA 'Edamame-NG\cache'
 $runDir = $null
 
 function Get-CatalogEntries([string]$Path) {
-    $index = Join-Path $Path 'local-eop.tsv'
-    if (-not (Test-Path -LiteralPath $index -PathType Leaf)) { return @() }
-    return @(Import-Csv -LiteralPath $index -Delimiter "`t")
+    $rows = @()
+    foreach ($name in @('local-eop.tsv', 'curated-eop.tsv')) {
+        $index = Join-Path $Path $name
+        if (Test-Path -LiteralPath $index -PathType Leaf) {
+            $rows += @(Import-Csv -LiteralPath $index -Delimiter "`t")
+        }
+    }
+    return $rows
 }
 
 function Write-CveIndex([string]$CatalogPath, [string[]]$Suggested, [string]$Destination) {
     $catalog = @{}
     $indexPath = Join-Path $CatalogPath 'local-eop.tsv'
     if (Test-Path -LiteralPath $indexPath -PathType Leaf) {
-        foreach ($item in @(Get-CatalogEntries $CatalogPath)) { $catalog[$item.cve] = $item }
+        foreach ($item in @(Get-CatalogEntries $CatalogPath)) {
+            if (-not $catalog.ContainsKey($item.cve)) { $catalog[$item.cve] = $item }
+        }
     } else {
         Write-Warning 'Offline CVE catalog unavailable; retaining CVE.org links.'
     }

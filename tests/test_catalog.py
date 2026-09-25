@@ -65,10 +65,13 @@ with tempfile.TemporaryDirectory(prefix="edamame-catalog-") as root:
     env = dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}", LOCALAPPDATA=str(work))
     linux = run(["bash", "edamame-ng.sh", "--cve", "CVE-2025-32463"], env).stdout
     assert "indexed-review-only\tlinux" in linux
+    assert "indexed-review-only\tlinux\tglibc" in run(
+        ["bash", "edamame-ng.sh", "--cve", "CVE-2023-4911"], env).stdout
     assert "unindexed" in run(["bash", "edamame-ng.sh", "--cve", "CVE-2099-99999"], env).stdout
     bundled = run(["bash", "edamame-ng.sh", "--poc", "CVE-2025-32463"], env).stdout
     assert "verified-bundle" in bundled and "exact-build-only" in bundled
     assert "reference-only" in run(["bash", "edamame-ng.sh", "--poc", "CVE-2021-4034"], env).stdout
+    assert "unreviewed-crash-risk" in run(["bash", "edamame-ng.sh", "--poc", "CVE-2024-1086"], env).stdout
     assert "not-indexed" in run(["bash", "edamame-ng.sh", "--poc", "CVE-2099-99999"], env).stdout
     assert run(["bash", "edamame-ng.sh", "--cve", "bad-id"], env, False).returncode == 2
 
@@ -76,6 +79,9 @@ with tempfile.TemporaryDirectory(prefix="edamame-catalog-") as root:
         windows = run([str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
                        "-Cve", "CVE-2021-36934"], env).stdout
         assert "indexed-review-only\twindows" in windows
+        assert "indexed-review-only\tlinux\tglibc" in run(
+            [str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
+             "-Cve", "CVE-2023-4911"], env).stdout
         poc = run([str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
                    "-Poc", "CVE-2025-32463"], env).stdout
         assert "verified-bundle" in poc
@@ -86,6 +92,18 @@ with tempfile.TemporaryDirectory(prefix="edamame-catalog-") as root:
 
     copied = work / "tampered"
     shutil.copytree(ROOT / "catalog", copied)
+    with (copied / "curated-eop.tsv").open("a") as supplement:
+        supplement.write("CVE-2025-32463\twindows\tincorrect-duplicate\t\thttps://example.invalid/\n")
+    assert "indexed-review-only\tlinux\tSudo" in run(
+        ["bash", "edamame-ng.sh", "--cve", "CVE-2025-32463",
+         "--catalog-dir", str(copied)], env).stdout
+    if PWSH.is_file():
+        assert "indexed-review-only\tlinux\tSudo" in run(
+            [str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
+             "-Cve", "CVE-2025-32463", "-CatalogDir", str(copied)], env).stdout
+    (copied / "curated-eop.tsv").unlink()
+    assert "unindexed" in run(["bash", "edamame-ng.sh", "--cve", "CVE-2023-4911",
+                               "--catalog-dir", str(copied)], env).stdout
     (copied / "pocs/CVE-2025-32463/sudo-chwoot.sh").write_text("tampered\n")
     assert run(["bash", "edamame-ng.sh", "--poc", "CVE-2025-32463",
                 "--catalog-dir", str(copied)], env, False).returncode == 2

@@ -1,0 +1,2 @@
+cve	platform	product	kev_date	reference
+CVE-2023-4911	linux	glibc		https://www.qualys.com/2023/10/03/cve-2023-4911/looney-tunables-local-privilege-escalation-glibc-ld-so.txt
