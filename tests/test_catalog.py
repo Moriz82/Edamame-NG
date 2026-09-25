@@ -71,7 +71,7 @@ with tempfile.TemporaryDirectory(prefix="edamame-catalog-") as root:
         "CVE-2023-2640", "CVE-2023-32629", "CVE-2024-0132", "CVE-2024-21626",
         "CVE-2025-31133", "CVE-2025-52565", "CVE-2025-52881",
     )
-    assert len({line.split("\t")[0] for line in (ROOT / "catalog/curated-eop.tsv").read_text().splitlines()[1:]}) == 8
+    assert len({line.split("\t")[0] for line in (ROOT / "catalog/curated-eop.tsv").read_text().splitlines()[1:]}) == 9
     for identifier in curated_ids:
         assert f"{identifier}\tindexed-review-only\tlinux\t" in run(
             ["bash", "edamame-ng.sh", "--cve", identifier], env).stdout
@@ -80,6 +80,7 @@ with tempfile.TemporaryDirectory(prefix="edamame-catalog-") as root:
     assert "verified-bundle" in bundled and "exact-build-only" in bundled
     assert "reference-only" in run(["bash", "edamame-ng.sh", "--poc", "CVE-2021-4034"], env).stdout
     assert "unreviewed-crash-risk" in run(["bash", "edamame-ng.sh", "--poc", "CVE-2024-1086"], env).stdout
+    assert "reference-only" in run(["bash", "edamame-ng.sh", "--poc", "CVE-2023-21768"], env).stdout
     assert "not-indexed" in run(["bash", "edamame-ng.sh", "--poc", "CVE-2099-99999"], env).stdout
     assert run(["bash", "edamame-ng.sh", "--cve", "bad-id"], env, False).returncode == 2
 
@@ -97,6 +98,9 @@ with tempfile.TemporaryDirectory(prefix="edamame-catalog-") as root:
         poc = run([str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
                    "-Poc", "CVE-2025-32463"], env).stdout
         assert "verified-bundle" in poc
+        assert "unreviewed-kernel-crash-risk" in run(
+            [str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
+             "-Poc", "CVE-2023-21768"], env).stdout
         assert "not-indexed" in run([str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
                                      "-Poc", "CVE-2099-99999"], env).stdout
     assert not (work / "network-attempt").exists()

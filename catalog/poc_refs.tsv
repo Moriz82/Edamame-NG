@@ -3,6 +3,7 @@ CVE-2016-5195	poc-collection	https://github.com/dirtycow/dirtycow.github.io/wiki
 CVE-2021-3156	poc-source	https://github.com/blasty/CVE-2021-3156	-	-	-	unconfirmed	unreviewed-build-specific
 CVE-2021-4034	poc-source	https://github.com/PwnFunction/CVE-2021-4034	-	-	-	unconfirmed	unreviewed
 CVE-2022-0847	poc-source	https://dirtypipe.cm4all.com/	-	-	-	unconfirmed	unreviewed
+CVE-2023-21768	poc-source	https://github.com/chompie1337/Windows_LPE_AFD_CVE-2023-21768	-	-	-	unconfirmed	unreviewed-kernel-crash-risk
 CVE-2023-4911	poc-source	https://github.com/leesh3288/CVE-2023-4911	-	-	-	unconfirmed	unreviewed-build-specific
 CVE-2024-1086	poc-source	https://github.com/Notselwyn/CVE-2024-1086	-	-	-	unconfirmed	unreviewed-crash-risk
 CVE-2025-32463	poc-derived	https://github.com/pr0v3rbs/CVE-2025-32463_chwoot/tree/5c36150c6b4e64961ca133e618da1a48d1444d22	5c36150c6b4e64961ca133e618da1a48d1444d22	pocs/CVE-2025-32463/sudo-chwoot.sh	9826979c7a3cb1ca582862768d74245806051db5601c7b6a7e13bde93b8052d7	MIT	vm-proof-exact-build-only

@@ -1,4 +1,5 @@
 cve	platform	product	kev_date	reference
+CVE-2023-21768	windows	Windows AFD		https://msrc.microsoft.com/update-guide/vulnerability/CVE-2023-21768
 CVE-2023-2640	linux	Ubuntu OverlayFS		https://ubuntu.com/security/CVE-2023-2640
 CVE-2023-32629	linux	Ubuntu OverlayFS		https://ubuntu.com/security/CVE-2023-32629
 CVE-2023-4911	linux	glibc		https://www.qualys.com/2023/10/03/cve-2023-4911/looney-tunables-local-privilege-escalation-glibc-ld-so.txt
