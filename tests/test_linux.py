@@ -4,6 +4,8 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
+import shlex
+import signal
 import subprocess
 import tempfile
 import time
@@ -23,6 +25,15 @@ def run(script, env, *args, check=True):
     )
 
 
+def wait_for_paths(paths, process=None):
+    deadline = time.monotonic() + 10
+    while not all(path.exists() for path in paths):
+        if process is not None and process.poll() is not None:
+            raise AssertionError("fixture exited before descendants were ready")
+        assert time.monotonic() < deadline, paths
+        time.sleep(0.02)
+
+
 with tempfile.TemporaryDirectory(prefix="edamame-test-") as temp:
     base = Path(temp)
     fake = base / "fake-bin"
@@ -36,7 +47,7 @@ with tempfile.TemporaryDirectory(prefix="edamame-test-") as temp:
     write(fake / "uname", "#!/bin/sh\necho Linux\n")
     write(fake / "hostname", "#!/bin/sh\necho fixture-host\n")
     write(fake / "id", "#!/bin/sh\necho 0\n")
-    write(fake / "timeout", "#!/bin/sh\nshift\ncase \"$*\" in *linpeas.sh*) if [ -n \"${EDAMAME_TEST_TIMEOUT_FAIL:-}\" ]; then echo 'CVE-2026-99999 partial'; exit 124; fi;; esac\nexec \"$@\"\n")
+    write(fake / "timeout", "#!/bin/sh\nif [ \"$1\" = --foreground ]; then shift 3; fi\nshift\ncase \"$*\" in *linpeas.sh*) if [ -n \"${EDAMAME_TEST_TIMEOUT_FAIL:-}\" ]; then echo 'CVE-2026-99999 partial'; exit 124; fi;; esac\nexec \"$@\"\n")
     write(fake / "sudo", "#!/bin/sh\n[ -z \"${EDAMAME_TEST_NO_SUDO:-}\" ] || exit 1\nif [ \"$1\" = -n ] && [ \"$2\" = /bin/bash ]; then exit 0; fi\nexit 1\n")
     write(fake / "docker", "#!/bin/sh\nexit 1\n")
     write(fake / "getcap", "#!/bin/sh\nexit 1\n")
@@ -294,4 +305,161 @@ else:
     finished_dir = next(finished_runs.iterdir())
     assert "linpeas\tchecked" in (finished_dir / "coverage.tsv").read_text()
     assert "completed-after-shell" in (finished_dir / "linpeas-output.txt").read_text()
+
+    # Use real process groups and GNU timeout for lifecycle regressions, even
+    # when the wider suite runs with a synthetic Linux uname on macOS.
+    real_timeout = shutil.which("timeout", path=os.environ["PATH"])
+    real_ps = shutil.which("ps", path=os.environ["PATH"])
+    assert real_timeout and real_ps
+    write(fake / "timeout", f'''#!/bin/sh
+if [ "$1" = --foreground ]; then
+    shift 4
+    exec {shlex.quote(real_timeout)} --foreground -k 1 "${{EDAMAME_TEST_LIMIT:-600}}" "$@"
+fi
+exec {shlex.quote(real_timeout)} "$@"
+''')
+    original_sudo = (fake / "sudo").read_text()
+    write(fake / "sudo", '''#!/bin/sh
+if [ -n "${EDAMAME_TEST_READY_DIR:-}" ]; then
+    for name in linpeas lse; do
+        count=0
+        while [ ! -f "$EDAMAME_TEST_READY_DIR/$name.ready" ]; do
+            count=$((count+1))
+            [ "$count" -lt 100 ] || exit 1
+            sleep 0.05
+        done
+    done
+fi
+''' + original_sudo.split("\n", 1)[1])
+    lifecycle_tools = base / "lifecycle-tools"
+    lifecycle_tools.mkdir()
+    for name in ("linpeas", "lse"):
+        asset = lifecycle_tools / f"{name}.sh"
+        write(asset, f'''#!/bin/bash
+echo CVE-2024-123456
+bash -c '
+    trap "" TERM
+    printf "%s\\n" "$$" > "$1.pid"
+    ps -p "$$" -o pgid= > "$1.group"
+    : > "$1.ready"
+    sleep 3
+    echo delayed-marker > "$1.late"
+    echo delayed-output
+' fixture "$EDAMAME_TEST_READY_DIR/{name}" &
+if [ -n "${{EDAMAME_TEST_ROOT_EXITS:-}}" ]; then exit 0; fi
+wait
+''')
+        (lifecycle_tools / f"{name}.sh.sha256").write_text(
+            hashlib.sha256(asset.read_bytes()).hexdigest() + "\n")
+
+    def descendant_alive(pid):
+        state = subprocess.run([real_ps, "-p", str(pid), "-o", "stat="],
+                               capture_output=True, text=True, check=False).stdout.strip()
+        return bool(state) and not state.startswith("Z")
+
+    timeout_wrapper = (fake / "timeout").read_text()
+    write(fake / "timeout", "#!/bin/sh\nexit 125\n")
+    unsupported_runs = base / "unsupported-capture-runs"
+    unsupported = run(ROOT / "edamame-ng.sh", env, "--scan", "--offline", "--no-shell",
+                      "--output-dir", str(unsupported_runs), "--tool-dir", str(lifecycle_tools))
+    unsupported_dir = next(unsupported_runs.iterdir())
+    assert "unsupported timeout or ps options" in unsupported.stderr
+    assert "linpeas\tunavailable" in (unsupported_dir / "coverage.tsv").read_text()
+    assert not (unsupported_dir / "linpeas-output.txt").exists()
+    assert "[SAVED] linpeas-output.txt" not in unsupported.stdout
+    write(fake / "timeout", timeout_wrapper)
+
+    for case in ("stop", "timeout", "root-exits", "signal", "startup-signal", "cleanup-failure"):
+        state_dir = base / f"lifecycle-{case}"
+        state_dir.mkdir()
+        lifecycle_runs = base / f"lifecycle-{case}-runs"
+        lifecycle_env = dict(env, EDAMAME_TEST_READY_DIR=str(state_dir))
+        args = ["bash", str(ROOT / "edamame-ng.sh"), "--scan", "--offline",
+                "--output-dir", str(lifecycle_runs), "--tool-dir", str(lifecycle_tools)]
+        if case in ("timeout", "root-exits", "signal"):
+            args.append("--no-shell")
+        if case == "timeout":
+            lifecycle_env["EDAMAME_TEST_LIMIT"] = "1"
+        if case == "root-exits":
+            lifecycle_env["EDAMAME_TEST_ROOT_EXITS"] = "1"
+        if case == "startup-signal":
+            write(fake / "ps", f'''#!/bin/sh
+if [ "$1" = -p ] && [ "$6" = lstart= ] &&
+   [ ! -f "$EDAMAME_TEST_READY_DIR/supervisor.pid" ]; then
+    printf '%s\\n' "$2" > "$EDAMAME_TEST_READY_DIR/supervisor.pid"
+    : > "$EDAMAME_TEST_READY_DIR/startup-paused"
+    while [ ! -f "$EDAMAME_TEST_READY_DIR/startup-release" ]; do sleep 0.02; done
+fi
+exec {shlex.quote(real_ps)} "$@"
+''')
+        if case == "cleanup-failure":
+            write(fake / "ps", f'''#!/bin/sh
+if [ "$1" = -e ] && [ -f "$EDAMAME_TEST_READY_DIR/linpeas.ready" ] &&
+   [ -f "$EDAMAME_TEST_READY_DIR/lse.ready" ]; then exit 1; fi
+exec {shlex.quote(real_ps)} "$@"
+''')
+        process = subprocess.Popen(args, env=lifecycle_env, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+        try:
+            if case == "startup-signal":
+                wait_for_paths([state_dir / "startup-paused"], process)
+                assert not list(state_dir.glob("*.ready")), "collector started before authorization"
+                process.send_signal(signal.SIGTERM)
+                (state_dir / "startup-release").touch()
+            else:
+                wait_for_paths([state_dir / "linpeas.ready", state_dir / "lse.ready"], process)
+            if case == "signal":
+                process.send_signal(signal.SIGTERM)
+            captured_stdout, captured_stderr = process.communicate(timeout=15)
+            expected_code = 143 if case in ("signal", "startup-signal") else 1 if case == "cleanup-failure" else 0
+            assert process.returncode == expected_code, (case, captured_stdout, captured_stderr)
+            lifecycle_dir = next(lifecycle_runs.iterdir())
+            if case == "startup-signal":
+                supervisor = int((state_dir / "supervisor.pid").read_text())
+                supervisor_state = subprocess.run([real_ps, "-p", str(supervisor), "-o", "stat="],
+                                                  capture_output=True, text=True, check=False).stdout.strip()
+                assert not supervisor_state, "unapproved supervisor was not terminated and reaped"
+                assert not list(state_dir.glob("*.ready")), "collector started after cancellation"
+                assert not list(state_dir.glob("*.late"))
+                assert "[SAVED]" not in captured_stdout
+                assert not list(lifecycle_dir.glob("*-output.txt"))
+                continue
+            snapshots = {}
+            for name in ("linpeas", "lse"):
+                pid = int((state_dir / f"{name}.pid").read_text())
+                assert not descendant_alive(pid), (case, name, "descendant survived")
+                output = lifecycle_dir / f"{name}-output.txt"
+                if case in ("signal", "cleanup-failure"):
+                    assert not output.exists(), (case, name)
+                    assert f"[SAVED] {name}-output.txt" not in captured_stdout
+                else:
+                    snapshots[output] = output.read_bytes()
+                    assert f"{name}\tpartial" in (lifecycle_dir / "coverage.tsv").read_text()
+                    assert captured_stdout.index("[FOUND]") < captured_stdout.index(f"[SAVED] {name}-output.txt")
+            if case == "cleanup-failure":
+                assert "cleanup-failed" in (lifecycle_dir / "coverage.tsv").read_text()
+                assert "cleanup could not be confirmed" in captured_stderr
+            # Wait beyond the child's planned write, not merely until root exit.
+            time.sleep(3.1)
+            assert not list(state_dir.glob("*.late")), (case, "late descendant write")
+            for output, before in snapshots.items():
+                assert output.read_bytes() == before, (case, "final output changed")
+        finally:
+            (state_dir / "startup-release").touch()
+            # Never leak a failing fixture; target only its recorded child group.
+            for pid_file in state_dir.glob("*.pid"):
+                pid = int(pid_file.read_text())
+                if pid_file.name == "supervisor.pid" and descendant_alive(pid):
+                    os.kill(pid, signal.SIGKILL)
+                group_file = pid_file.with_suffix(".group")
+                if group_file.exists() and descendant_alive(pid):
+                    group = int(group_file.read_text())
+                    if group != os.getpgrp() and os.getpgid(pid) == group:
+                        os.killpg(group, signal.SIGKILL)
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)
+            if (fake / "ps").exists():
+                (fake / "ps").unlink()
     print("Linux scan, alert order, partial capture, digest failures, cache, masking, resume rejection, and path guards passed")
+    print("Collector descendants stopped before finalization: stop, timeout, root exit, signal, startup signal, and failed confirmation passed")

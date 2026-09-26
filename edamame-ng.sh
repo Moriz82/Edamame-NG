@@ -578,16 +578,176 @@ linpeas_complete=0; lse_complete=0
 asset_from_release peass-ng/PEASS-ng linpeas.sh "$linpeas" && have_linpeas=1
 asset_from_release diego-treitos/linux-smart-enumeration lse.sh "$lse" && have_lse=1
 
-linpeas_pid=''; lse_pid=''
+# Keep a group leader alive until cleanup, even when timeout or the tool exits.
+# Bash job control supplies the same isolation on hosts without setsid.
+enum_labels=(linpeas lse)
+enum_pids=('' '')
+enum_identities=('' '')
+enum_authorized=(0 0)
+enum_statuses=(unavailable unavailable)
+enum_finished=(0 0)
+enum_cleanup_failed=0
+
+enum_group_live() {
+  local group=$1 exclude=${2:-0} snapshot
+  snapshot=$(ps -e -o pid= -o pgid= -o stat=) || return 2
+  awk -v group="$group" -v exclude="$exclude" '
+    $2 == group && $1 != exclude && $3 !~ /^Z/ { live=1 }
+    END { exit live ? 0 : 1 }' <<< "$snapshot"
+}
+
+enum_supervise() {
+  local label=$1 group result=0
+  shift
+  trap - EXIT INT TERM
+  trap ':' TERM INT
+  set +m
+  exec 9<> "$RUN_DIR/.capture/$label.control"
+  # The parent verifies this group before authorizing any tool to start.
+  IFS= read -r group <&9 || exit 1
+  timeout --foreground -k 1 600 "$@" 9>&- &
+  local monitor=$!
+  while :; do
+    wait "$monitor"; result=$?
+    kill -0 "$monitor" 2>/dev/null || break
+  done
+  printf '%s\n' "$result" > "$RUN_DIR/.capture/$label.exit"
+  if ((result == 124 || result == 137)); then
+    # Enforce timeout cleanup even while the main script is in an open shell.
+    kill -TERM -- "-$group" 2>/dev/null || true
+    IFS= read -r -t 1 _ <&9 || true
+    kill -KILL -- "-$group" 2>/dev/null || true
+  fi
+  # A builtin read keeps ownership stable without adding a helper process.
+  while :; do IFS= read -r _ <&9 || true; done
+}
+
+start_enum_capture() {
+  local index=$1 label=${enum_labels[$1]} monitor_enabled=0 identity group own_group dependency
+  local pending_signal=0
+  shift
+  for dependency in timeout ps mkfifo awk; do
+    if ! command -v "$dependency" >/dev/null 2>&1; then
+      printf '[WARN] %s capture unavailable: missing %s.\n' "$label" "$dependency" >&2
+      return
+    fi
+  done
+  if ! timeout --foreground -k 1 1 true >/dev/null 2>&1 ||
+     ! ps -e -o pid= -o pgid= -o stat= >/dev/null 2>&1; then
+    printf '[WARN] %s capture unavailable: unsupported timeout or ps options.\n' "$label" >&2
+    return
+  fi
+  if ! mkfifo "$RUN_DIR/.capture/$label.control"; then
+    printf '[WARN] %s capture unavailable: cannot create control FIFO.\n' "$label" >&2
+    return
+  fi
+  [[ $- == *m* ]] && monitor_enabled=1
+  set -m
+  # Defer cancellation across fork/PID publication so EXIT always owns the child.
+  trap 'pending_signal=130' INT
+  trap 'pending_signal=143' TERM
+  enum_supervise "$label" "$@" > "$RUN_DIR/.capture/$label-output.txt" 2>&1 &
+  enum_pids[index]=$!
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  ((pending_signal == 0)) || exit "$pending_signal"
+  ((monitor_enabled)) || set +m
+  identity=$(ps -p "${enum_pids[$index]}" -o pgid= -o lstart=)
+  read -r group _ <<< "$identity"
+  own_group=$(ps -p "$$" -o pgid= | tr -d ' ')
+  if [[ $group != "${enum_pids[$index]}" || $group == "$own_group" || -z $own_group ]]; then
+    # No tool has been authorized yet; only the waiting supervisor exists.
+    kill -KILL "${enum_pids[$index]}" 2>/dev/null || true
+    wait "${enum_pids[$index]}" 2>/dev/null || true
+    enum_finished[index]=1
+    enum_statuses[index]=cleanup-failed
+    enum_cleanup_failed=1
+    printf '[WARN] %s process-group isolation failed; capture withheld.\n' "$label" >&2
+    return
+  fi
+  enum_identities[index]=$identity
+  enum_statuses[index]=partial
+  # From this point cleanup can use the verified group, including before release.
+  enum_authorized[index]=1
+  printf '%s\n' "$group" > "$RUN_DIR/.capture/$label.control"
+}
+
+complete_enum_capture() {
+  local index=$1 stopped=${2:-0} group=${enum_pids[$1]} label=${enum_labels[$1]}
+  local state identity count result=1
+  [[ -n $group && ${enum_finished[$index]} == 0 ]] || return 0
+  if [[ ${enum_authorized[$index]} == 0 ]]; then
+    # The direct child is blocked on its FIFO and cannot have launched a tool.
+    # Its group identity may not have been published when cancellation arrived.
+    kill -KILL "$group" 2>/dev/null || true
+    for ((count=0; count<10; count++)); do
+      kill -0 "$group" 2>/dev/null || break
+      sleep 0.1
+    done
+    if ! kill -0 "$group" 2>/dev/null; then
+      wait "$group" 2>/dev/null || true
+      enum_finished[index]=1
+      enum_statuses[index]=partial
+      return 0
+    fi
+    enum_statuses[index]=cleanup-failed
+    enum_cleanup_failed=1
+    printf '[WARN] %s unapproved supervisor did not exit; capture withheld.\n' "$label" >&2
+    return 1
+  fi
+  # A stop request must not downgrade a collector that already finished.
+  [[ -f $RUN_DIR/.capture/$label.exit ]] && stopped=0
+  identity=$(ps -p "$group" -o pgid= -o lstart=)
+  if [[ -n $identity && $identity == "${enum_identities[$index]}" ]]; then
+    # A completed root with surviving descendants is still a partial run.
+    if enum_group_live "$group" "$group"; then stopped=1; fi
+    kill -TERM -- "-$group" 2>/dev/null || true
+    for ((count=0; count<5; count++)); do
+      enum_group_live "$group" "$group"; state=$?
+      ((state == 0)) || break
+      sleep 0.1
+    done
+    kill -KILL -- "-$group" 2>/dev/null || true
+    for ((count=0; count<10; count++)); do
+      enum_group_live "$group"; state=$?
+      ((state == 0)) || break
+      sleep 0.1
+    done
+  else
+    # A timeout may already have killed its supervisor and the whole group.
+    enum_group_live "$group"; state=$?
+  fi
+  if ((state != 1)); then
+    if ! kill -0 "$group" 2>/dev/null; then wait "$group" 2>/dev/null || true; fi
+    enum_statuses[index]=cleanup-failed
+    enum_cleanup_failed=1
+    printf '[WARN] %s cleanup could not be confirmed; capture withheld.\n' "$label" >&2
+    return 1
+  fi
+  wait "$group" 2>/dev/null || true
+  enum_finished[index]=1
+  if [[ -f $RUN_DIR/.capture/$label.exit ]]; then
+    IFS= read -r result < "$RUN_DIR/.capture/$label.exit"
+  fi
+  if [[ $result == 0 && $stopped == 0 ]]; then enum_statuses[index]=checked; fi
+  return 0
+}
+
+cleanup_enum_captures() {
+  local index
+  for index in 0 1; do complete_enum_capture "$index" 1 || true; done
+}
+trap cleanup_enum_captures EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 if ((have_linpeas)); then
   printf '[ENUM] LinPEAS\n'
-  timeout 600 bash "$linpeas" > "$RUN_DIR/.capture/linpeas-output.txt" 2>&1 &
-  linpeas_pid=$!
+  start_enum_capture 0 bash "$linpeas"
 fi
 if ((have_lse)); then
   printf '[ENUM] LSE\n'
-  timeout 600 bash "$lse" -i -l2 -c > "$RUN_DIR/.capture/lse-output.txt" 2>&1 &
-  lse_pid=$!
+  start_enum_capture 1 bash "$lse" -i -l2 -c
 fi
 
 # Only new bytes are screened. A 64-byte overlap catches a CVE split across
@@ -651,8 +811,7 @@ if [[ -n $selected && $NO_SHELL == 0 ]]; then
     open_shell "$selected"
     shell_opened=1
   else
-    [[ -n $linpeas_pid ]] && kill "$linpeas_pid" 2>/dev/null || true
-    [[ -n $lse_pid ]] && kill "$lse_pid" 2>/dev/null || true
+    cleanup_enum_captures
     printf '[ENUM] Stopping remaining enumerators after verified proof.\n'
   fi
 fi
@@ -660,24 +819,24 @@ fi
 while :; do
   screen_live_output
   active=0
-  [[ -n $linpeas_pid ]] && kill -0 "$linpeas_pid" 2>/dev/null && active=1
-  [[ -n $lse_pid ]] && kill -0 "$lse_pid" 2>/dev/null && active=1
+  for index in 0 1; do
+    [[ -n ${enum_pids[$index]} && ${enum_finished[$index]} == 0 && ${enum_statuses[$index]} != cleanup-failed ]] || continue
+    label=${enum_labels[$index]}
+    if [[ -f $RUN_DIR/.capture/$label.exit ]] || ! kill -0 "${enum_pids[$index]}" 2>/dev/null; then
+      complete_enum_capture "$index" || true
+    else
+      active=1
+    fi
+  done
   ((active)) || break
   sleep 0.2
 done
 screen_live_output
-if [[ -n $linpeas_pid ]]; then
-  if wait "$linpeas_pid"; then linpeas_complete=1; fi
-  printf 'linpeas\t%s\n' "$( ((linpeas_complete)) && printf checked || printf partial )" >> "$RUN_DIR/coverage.tsv"
-else
-  printf 'linpeas\tunavailable\n' >> "$RUN_DIR/coverage.tsv"
-fi
-if [[ -n $lse_pid ]]; then
-  if wait "$lse_pid"; then lse_complete=1; fi
-  printf 'lse\t%s\n' "$( ((lse_complete)) && printf checked || printf partial )" >> "$RUN_DIR/coverage.tsv"
-else
-  printf 'lse\tunavailable\n' >> "$RUN_DIR/coverage.tsv"
-fi
+[[ ${enum_statuses[0]} == checked ]] && linpeas_complete=1
+[[ ${enum_statuses[1]} == checked ]] && lse_complete=1
+for index in 0 1; do
+  printf '%s\t%s\n' "${enum_labels[$index]}" "${enum_statuses[$index]}" >> "$RUN_DIR/coverage.tsv"
+done
 for label in linpeas lse; do
   output="$RUN_DIR/.capture/$label-output.txt"
   if [[ -f $output ]]; then
@@ -735,8 +894,9 @@ printf 'Dump clear PSK keys from the Network Manager if available.\tunsupported\
 printf 'CVE build and patch applicability\tunsupported\toffline index is a review lead, not a vulnerable-build test\n' >> "$RUN_DIR/coverage.tsv"
 
 # The visible alerts above precede these final output filenames.
-for label in linpeas lse; do
-  if [[ -f $RUN_DIR/.capture/$label-output.txt ]]; then
+for index in 0 1; do
+  label=${enum_labels[$index]}
+  if [[ ${enum_statuses[$index]} != cleanup-failed && ${enum_finished[$index]} == 1 && -f $RUN_DIR/.capture/$label-output.txt ]]; then
     mv "$RUN_DIR/.capture/$label-output.txt" "$RUN_DIR/$label-output.txt"
     printf '[SAVED] %s-output.txt\n' "$label"
   fi
@@ -764,7 +924,8 @@ if [[ -n $selected ]]; then
   fi
   printf '%s\t%s\t%s\n' "$host_name" "$selected" "$evidence" > "$RUN_DIR/success.tsv"
   if (( ! shell_opened )); then open_shell "$selected"; fi
+  ((enum_cleanup_failed)) && exit 1
   exit 0
 fi
 printf '[RESULT] No supported local escalation recipe verified. See %s\n' "$RUN_DIR"
-exit 0
+exit "$enum_cleanup_failed"

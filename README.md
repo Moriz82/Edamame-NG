@@ -4,7 +4,7 @@ Host-run Linux and Windows privilege escalation assessment scripts. The two supp
 
 ## Run
 
-Linux (Bash, `curl`, `timeout`, `sha256sum` or `shasum`):
+Linux (Bash, `curl`, GNU `timeout`, `ps` with PGID/STAT/start-time fields, `mkfifo`, `awk`, and `sha256sum` or `shasum`):
 
 ```sh
 bash edamame-ng.sh --scan --output-dir "$HOME/edamame-ng-runs"
@@ -39,7 +39,9 @@ The fixture creates a stopped, manual LocalSystem service and a protected regist
 
 Without `--scan`/`-Scan` or `--resume`/`-Resume`, a previous success offers Resume as the default. `--no-shell`/`-NoShell` proves a recipe without opening a shell. `--tool-dir`/`-ToolDir` accepts predownloaded assets only when each asset has an adjacent `.sha256` file containing its expected SHA-256. A new scan checks current official releases unless a tool directory is supplied. A failed update uses only a previously verified cache copy and prints a warning.
 
-Scans start supported enumerators while native recipe checks run. A verified route can open a shell before enumeration finishes. By default, remaining collectors stop after a successful interactive proof and their output is labeled partial. Use `--finish-bg-enum` or `-FinishBgEnum` to let them finish while the shell is open; final named output files are saved after the shell exits. With `--no-shell`/`-NoShell`, the runner waits for collectors to finish or reach their per-tool timeouts; check `tools.tsv` for incomplete runs. Enumerator CVE strings are screened as output grows, but they are review leads and do not trigger unreviewed exploit code.
+Scans start supported enumerators while native recipe checks run. A verified route can open a shell before enumeration finishes. By default, remaining collectors stop after a successful interactive proof and their output is labeled partial. Use `--finish-bg-enum` or `-FinishBgEnum` to let them finish while the shell is open; final named output files are saved after the shell exits. With `--no-shell`/`-NoShell`, the runner waits for collectors to finish or reach their per-tool timeouts; check `coverage.tsv` for incomplete runs. Enumerator CVE strings are screened as output grows, but they are review leads and do not trigger unreviewed exploit code.
+
+Linux starts each collector in an isolated, verified process group. It waits for that group to stop before naming a final output file. If it cannot confirm cleanup, it keeps the partial capture private, records `cleanup-failed`, and exits unsuccessfully. Missing process-control commands or unsupported `timeout`/`ps` options make the affected collector unavailable.
 
 For a scan with no network access, supply the verified local assets and the bundled catalog:
 
