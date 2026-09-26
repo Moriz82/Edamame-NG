@@ -119,13 +119,7 @@ function Get-WeakServiceLabState {
 
 function Get-TrustedServiceControl {
     $path = Join-Path ([Environment]::SystemDirectory) 'sc.exe'
-    $file = Get-Item -LiteralPath $path -ErrorAction Stop
-    $signature = Get-AuthenticodeSignature -LiteralPath $path -ErrorAction Stop
-    if ($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
-        $signature.Status -ne 'Valid' -or
-        $signature.SignerCertificate.Subject -notmatch '^CN=Microsoft (Windows|Corporation),') {
-        throw 'Trusted service control executable unavailable'
-    }
+    if (-not (Test-TrustedSystemBinary $path)) { throw 'Trusted service control executable unavailable' }
     return $path
 }
 
@@ -178,11 +172,7 @@ function Invoke-WeakServiceLabRecipe([string]$ExpectedFixtureId) {
     $trustedPowerShell = Get-TrustedPowerShell
     $trustedSc = Get-TrustedServiceControl
     $trustedCmd = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
-    $cmdFile = Get-Item -LiteralPath $trustedCmd -ErrorAction Stop
-    $cmdSignature = Get-AuthenticodeSignature -LiteralPath $trustedCmd -ErrorAction Stop
-    if ($cmdFile.PSIsContainer -or ($cmdFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
-        $cmdSignature.Status -ne 'Valid' -or
-        $cmdSignature.SignerCertificate.Subject -notmatch '^CN=Microsoft (Windows|Corporation),') { return $false }
+    if (-not (Test-TrustedSystemBinary $trustedCmd)) { return $false }
     $pipeName = 'EdamameNG-' + [Guid]::NewGuid().ToString('N')
     $nonceBytes = New-Object byte[] 32
     $random = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -203,8 +193,8 @@ function Invoke-WeakServiceLabRecipe([string]$ExpectedFixtureId) {
 `$p = New-Object IO.Pipes.NamedPipeClientStream -ArgumentList '.', '$pipeName', ([IO.Pipes.PipeDirection]::InOut), ([IO.Pipes.PipeOptions]::None), ([Security.Principal.TokenImpersonationLevel]::Impersonation)
 try {
     `$p.Connect(15000)
-    `$r = New-Object IO.BinaryReader -ArgumentList `$p, ([Text.Encoding]::UTF8)
-    `$w = New-Object IO.BinaryWriter -ArgumentList `$p, ([Text.Encoding]::UTF8)
+    `$r = New-Object IO.BinaryReader -ArgumentList `$p
+    `$w = New-Object IO.BinaryWriter -ArgumentList `$p
     function send([string]`$s) {
         `$b = [Text.Encoding]::UTF8.GetBytes(`$s)
         if (`$b.Length -gt 1048576) { `$b = [Text.Encoding]::UTF8.GetBytes('Output exceeds 1 MiB limit') }
@@ -244,7 +234,7 @@ try {
         [Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($changedPath))
     ).Replace('-', '')
     $parentId = $PID
-    $parentTicks = [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks
+    $parentTicks = [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks.ToString()
     $quotedReady = $watchReady.Replace("'", "''")
     $quotedStatus = $watchStatus.Replace("'", "''")
     $quotedSc = $trustedSc.Replace("'", "''")
@@ -265,7 +255,7 @@ while (`$true) {
     try {
         `$current = (Get-ItemProperty -LiteralPath `$key).ImagePath
         `$parent = Get-Process -Id $parentId -ErrorAction SilentlyContinue
-        `$alive = `$parent -and `$parent.StartTime.ToUniversalTime().Ticks -eq $parentTicks
+        `$alive = `$parent -and (`$parent.StartTime.ToUniversalTime().Ticks.ToString() -ceq '$parentTicks')
         if (`$current -ceq `$original) {
             if (`$seen -or -not `$alive) { Set-Content -LiteralPath `$status -Value original -Encoding ASCII; exit 0 }
         } else {
@@ -298,7 +288,7 @@ while (`$true) {
     $writer = $null
     try {
         $watchdog = Start-Process -FilePath $trustedPowerShell -ArgumentList "-NoProfile -WindowStyle Hidden -EncodedCommand $watchEncoded" -WindowStyle Hidden -PassThru
-        for ($i = 0; $i -lt 30 -and -not (Test-Path -LiteralPath $watchReady); $i++) {
+        for ($i = 0; $i -lt 150 -and -not (Test-Path -LiteralPath $watchReady); $i++) {
             if ($watchdog.HasExited) { break }
             Start-Sleep -Milliseconds 100
         }
@@ -321,7 +311,7 @@ while (`$true) {
         $connected = $pipe.BeginWaitForConnection($null, $null)
         if (-not $connected.AsyncWaitHandle.WaitOne(20000)) { throw 'SYSTEM pipe connection timed out' }
         $pipe.EndWaitForConnection($connected)
-        $writer = New-Object IO.BinaryWriter -ArgumentList $pipe, ([Text.Encoding]::UTF8)
+        $writer = New-Object IO.BinaryWriter -ArgumentList $pipe
         $hello = Read-PipeFrame $pipe 256 10000
         if ($hello -cne "1|$nonce|S-1-5-18") { throw 'SYSTEM pipe identity proof failed' }
         if ([EdamameWeakServiceNative]::ConnectedClientSid($pipe) -cne 'S-1-5-18') {

@@ -31,6 +31,7 @@ New-Item -ItemType Directory -Path $testRoot | Out-Null
 try {
     $tampered = Join-Path $testRoot 'tampered'
     Copy-Item -LiteralPath (Join-Path $root 'catalog') -Destination $tampered -Recurse
+    Get-ChildItem -LiteralPath $tampered -Recurse -File | ForEach-Object { $_.IsReadOnly = $false }
     Add-Content -LiteralPath (Join-Path $tampered 'curated-eop.tsv') -Value "CVE-2025-32463`twindows`tincorrect-duplicate`t`thttps://example.invalid/"
     $duplicateIndex = Join-Path $testRoot 'duplicate-index.tsv'
     Write-CveIndex $tampered @('CVE-2025-32463') $duplicateIndex

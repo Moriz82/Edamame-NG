@@ -214,18 +214,32 @@ function Write-CapturedTail([string[]]$Paths, [long[]]$Offsets, [Text.Decoder[]]
             $Offsets[$i] = $reader.Position
         } finally { $reader.Dispose() }
     }
+    [Console]::Out.Flush()
 }
 
 function Invoke-CapturedProcess([string]$FilePath, [string]$Arguments, [string]$OutputPath, [int]$TimeoutSeconds) {
     $stdout = "$OutputPath.stdout"
     $stderr = "$OutputPath.stderr"
-    $options = @{ FilePath = $FilePath; PassThru = $true
-        RedirectStandardOutput = $stdout; RedirectStandardError = $stderr }
-    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { $options.WindowStyle = 'Hidden' }
-    if ($Arguments) { $options.ArgumentList = $Arguments }
-    $process = Start-Process @options
-    Set-Content -LiteralPath "$OutputPath.pid" -Value $process.Id -Encoding ASCII
+    $start = New-Object Diagnostics.ProcessStartInfo
+    $start.FileName = $FilePath
+    $start.Arguments = $Arguments
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $start
+    $stdoutStream = $null
+    $stderrStream = $null
+    $started = $false
     try {
+        $stdoutStream = New-Object IO.FileStream -ArgumentList @($stdout, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite, 1)
+        $stderrStream = New-Object IO.FileStream -ArgumentList @($stderr, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite, 1)
+        [void]$process.Start()
+        $started = $true
+        $stdoutTask = $process.StandardOutput.BaseStream.CopyToAsync($stdoutStream)
+        $stderrTask = $process.StandardError.BaseStream.CopyToAsync($stderrStream)
+        Set-Content -LiteralPath "$OutputPath.pid" -Value $process.Id -Encoding ASCII
         if ($script:ShowRawOutput) {
             $paths = @($stdout, $stderr)
             $offsets = [long[]]@(0, 0)
@@ -246,11 +260,15 @@ function Invoke-CapturedProcess([string]$FilePath, [string]$Arguments, [string]$
             [void]$process.WaitForExit(5000)
             Write-Warning "$([IO.Path]::GetFileName($FilePath)) exceeded $TimeoutSeconds seconds; preserving partial output."
         }
-        if ($script:ShowRawOutput) {
-            Write-CapturedTail $paths $offsets $decoders
+        if (-not $stdoutTask.Wait(5000) -or -not $stderrTask.Wait(5000)) {
+            throw 'Capture streams did not finish after the process exited.'
         }
+        if ($script:ShowRawOutput) { Write-CapturedTail $paths $offsets $decoders }
         $exitCode = if ($finished) { $process.ExitCode } else { -1 }
     } finally {
+        if ($started -and -not $process.HasExited) { try { $process.Kill() } catch { } }
+        if ($stdoutStream) { $stdoutStream.Dispose() }
+        if ($stderrStream) { $stderrStream.Dispose() }
         $process.Dispose()
         Remove-Item -LiteralPath "$OutputPath.pid" -Force -ErrorAction SilentlyContinue
     }
@@ -356,6 +374,7 @@ function Watch-EnumOutput($Entry, [hashtable]$SeenCves) {
                 if ($script:ShowRawOutput) {
                     $newStart = [int]([Math]::Min($buffer.Length, $offset - [Math]::Max(0, $offset - 64)))
                     [Console]::Out.Write([Console]::OutputEncoding.GetString($buffer, $newStart, $buffer.Length - $newStart))
+                    [Console]::Out.Flush()
                 }
                 foreach ($match in [regex]::Matches($text, 'CVE-[0-9]{4}-[0-9]{4,}')) {
                     $SeenCves[$match.Value] = $true
@@ -560,18 +579,58 @@ function Test-AdminMembership {
     return $groups -match 'S-1-5-32-544'
 }
 
+function Test-TrustedSystemBinary([string]$Path) {
+    $systemDir = [Environment]::SystemDirectory
+    $allowed = @(
+        (Join-Path $systemDir 'sc.exe'),
+        (Join-Path $systemDir 'cmd.exe'),
+        (Join-Path $systemDir 'WindowsPowerShell\v1.0\powershell.exe')
+    )
+    try {
+        $file = Get-Item -LiteralPath $Path -ErrorAction Stop
+        if ($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+            $file.FullName -notin $allowed) { return $false }
+        $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName -ErrorAction Stop
+        if ($signature.Status -eq 'Valid' -and $signature.SignerCertificate -and
+            $signature.SignerCertificate.Subject -match '^CN=Microsoft (Windows|Corporation),') { return $true }
+        # Windows PowerShell 3 on Server 2012 can report catalog-signed OS
+        # files as NotSigned. Accept only the exact WRP-protected system files.
+        $version = [Environment]::OSVersion.Version
+        if ($signature.Status -ne 'NotSigned' -or $version.Major -ne 6 -or $version.Minor -ne 2) { return $false }
+        if (-not ('EdamameSystemFileTrust' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class EdamameSystemFileTrust {
+    [DllImport("sfc.dll", CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SfcIsFileProtected(IntPtr rpcHandle, string fileName);
+}
+'@ -ErrorAction Stop
+        }
+        if (-not [EdamameSystemFileTrust]::SfcIsFileProtected([IntPtr]::Zero, $file.FullName)) { return $false }
+        $installer = New-Object Security.Principal.NTAccount -ArgumentList @('NT SERVICE', 'TrustedInstaller')
+        $installerSid = $installer.Translate([Security.Principal.SecurityIdentifier]).Value
+        foreach ($item in @($file.FullName, (Split-Path -Parent $file.FullName))) {
+            if ((Get-Acl -LiteralPath $item).GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $installerSid) {
+                return $false
+            }
+        }
+        $writable = $null
+        try {
+            $writable = [IO.File]::Open($file.FullName, [IO.FileMode]::Open,
+                [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+            return $false
+        } catch [UnauthorizedAccessException] {
+            return $true
+        } finally { if ($writable) { $writable.Dispose() } }
+    } catch { return $false }
+}
+
 function Get-TrustedPowerShell {
     $path = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
-    $file = Get-Item -LiteralPath $path -ErrorAction Stop
-    if ($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-        throw 'System PowerShell is not a regular file.'
-    }
-    $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName -ErrorAction Stop
-    if ($signature.Status -ne 'Valid' -or
-        $signature.SignerCertificate.Subject -notmatch '^CN=Microsoft (Windows|Corporation),') {
-        throw 'System PowerShell signature verification failed.'
-    }
-    return $file.FullName
+    if (-not (Test-TrustedSystemBinary $path)) { throw 'System PowerShell verification failed.' }
+    return $path
 }
 
 function New-ProofMarker([string]$Name) {

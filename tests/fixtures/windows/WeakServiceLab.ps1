@@ -1,4 +1,4 @@
-#requires -Version 5.1
+#requires -Version 3.0
 [CmdletBinding(DefaultParameterSetName = 'Status')]
 param(
     [Parameter(Mandatory, ParameterSetName = 'Create')][switch]$Create,
@@ -69,11 +69,11 @@ function Set-ProtectedMarkerAcl {
     $acl = Get-Acl -Path $markerPath
     $acl.SetAccessRuleProtection($true, $false)
     foreach ($sidText in @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-32-545')) {
-        $sid = [Security.Principal.SecurityIdentifier]::new($sidText)
+        $sid = New-Object Security.Principal.SecurityIdentifier -ArgumentList $sidText
         $rights = if ($sidText -eq 'S-1-5-32-545') {
             [Security.AccessControl.RegistryRights]::ReadKey
         } else { [Security.AccessControl.RegistryRights]::FullControl }
-        $rule = [Security.AccessControl.RegistryAccessRule]::new(
+        $rule = New-Object Security.AccessControl.RegistryAccessRule -ArgumentList @(
             $sid, $rights, [Security.AccessControl.InheritanceFlags]::None,
             [Security.AccessControl.PropagationFlags]::None,
             [Security.AccessControl.AccessControlType]::Allow)
@@ -119,16 +119,20 @@ if ($Create) {
     if (Test-Path -LiteralPath $markerPath) { throw 'Fixture marker already exists.' }
     if ((Get-FixtureServiceStatus) -ne 'absent') { throw 'Fixture service already exists.' }
     $testSid = if ($TestUser -match '^S-1-(?:[0-9]+-)+[0-9]+$') {
-        [Security.Principal.SecurityIdentifier]::new($TestUser)
+        New-Object Security.Principal.SecurityIdentifier -ArgumentList $TestUser
     } else {
-        ([Security.Principal.NTAccount]::new($TestUser)).Translate([Security.Principal.SecurityIdentifier])
+        $accountName = if ($TestUser.StartsWith('.\')) {
+            [Environment]::MachineName + '\' + $TestUser.Substring(2)
+        } else { $TestUser }
+        (New-Object Security.Principal.NTAccount -ArgumentList $accountName).Translate([Security.Principal.SecurityIdentifier])
     }
-    $localUsers = @(Get-LocalUser | Where-Object { $_.SID.Value -ceq $testSid.Value })
-    if ($localUsers.Count -ne 1 -or -not $localUsers[0].Enabled) {
+    $localUsers = @(Get-WmiObject -Class Win32_UserAccount -Filter "SID='$($testSid.Value)' AND LocalAccount=TRUE")
+    if ($localUsers.Count -ne 1 -or $localUsers[0].Disabled) {
         throw 'Test SID must identify one enabled local user account.'
     }
-    $administrators = Get-LocalGroup -SID 'S-1-5-32-544'
-    if ([EdamameLocalGroupNative]::ContainsSid($administrators.Name, $testSid.Value)) {
+    $administrators = (New-Object Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value
+    $administratorsName = $administrators.Substring($administrators.LastIndexOf('\') + 1)
+    if ([EdamameLocalGroupNative]::ContainsSid($administratorsName, $testSid.Value)) {
         throw 'Test user must not be a local Administrator.'
     }
     $original = Join-Path ([Environment]::SystemDirectory) 'svchost.exe'
@@ -151,8 +155,8 @@ if ($Create) {
         $raw = Invoke-Sc @('sdshow', $serviceName)
         $sddl = ([regex]::Match($raw, 'D:.*')).Value.Trim()
         if (-not $sddl) { throw 'Service DACL unavailable.' }
-        $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($sddl)
-        $ace = [Security.AccessControl.CommonAce]::new(
+        $descriptor = New-Object Security.AccessControl.RawSecurityDescriptor -ArgumentList $sddl
+        $ace = New-Object Security.AccessControl.CommonAce -ArgumentList @(
             [Security.AccessControl.AceFlags]::None,
             [Security.AccessControl.AceQualifier]::AccessAllowed,
             0x17, $testSid, $false, $null)

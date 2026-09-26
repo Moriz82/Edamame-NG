@@ -5,6 +5,10 @@ $tokens = $null
 $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($source, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw "PowerShell parse failed: $errors" }
+if (-not (Get-Command Get-FileHash -ErrorAction SilentlyContinue)) {
+    $hashFn = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-FileHash' }, $true)
+    . ([scriptblock]::Create($hashFn.Extent.Text))
+}
 $fn = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-ReleaseAsset' }, $true)
 . ([scriptblock]::Create($fn.Extent.Text))
 function Set-PrivateDirectory([string]$Path) { New-Item -ItemType Directory -Path $Path -Force | Out-Null }

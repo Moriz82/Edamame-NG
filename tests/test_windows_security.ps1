@@ -15,12 +15,12 @@ $OutputDir = Join-Path $testRoot 'runs'
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 try {
     $acl = Get-Acl -LiteralPath $OutputDir
-    $everyone = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
+    $everyone = New-Object System.Security.Principal.SecurityIdentifier -ArgumentList 'S-1-1-0'
     $read = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
     $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
     $none = [System.Security.AccessControl.PropagationFlags]::None
     $allow = [System.Security.AccessControl.AccessControlType]::Allow
-    $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($everyone, $read, $inherit, $none, $allow))
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList $everyone, $read, $inherit, $none, $allow))
     Set-Acl -LiteralPath $OutputDir -AclObject $acl
     if (-not ((Get-Acl -LiteralPath $OutputDir).Access.IdentityReference.Value -contains 'Everyone' -or
               (Get-Acl -LiteralPath $OutputDir).Access.IdentityReference.Value -contains 'S-1-1-0')) {
