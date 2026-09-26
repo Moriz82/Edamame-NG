@@ -18,6 +18,15 @@ EXPECTED_POC = re.search(r"^CVE_POC_SHA='([0-9a-f]{64})'$", LINUX_RUNNER, re.M)
 assert EXPECTED_POC and EXPECTED_POC.group(1) == hashlib.sha256(
     (ROOT / "catalog/pocs/CVE-2025-32463/sudo-chwoot.sh").read_bytes()).hexdigest()
 
+if (ROOT / ".git").exists():
+    for asset in ("catalog/local-eop-details.tsv", "catalog/cve-ids/2025.tsv",
+                  "catalog/pocs/CVE-2025-32463/sudo-chwoot.sh"):
+        stored = subprocess.check_output(["git", "show", f"HEAD:{asset}"], cwd=ROOT)
+        windows_checkout = subprocess.check_output(
+            ["git", "-c", "core.autocrlf=true", "cat-file", "--filters", f"HEAD:{asset}"],
+            cwd=ROOT)
+        assert windows_checkout == stored, f"Windows checkout changes pinned catalog bytes: {asset}"
+
 
 def run(args, env=None, check=True):
     return subprocess.run(args, cwd=ROOT, env=env, text=True, capture_output=True,
