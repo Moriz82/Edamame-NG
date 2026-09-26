@@ -101,7 +101,7 @@ else:
     details = (run_dir / "cve-details.tsv").read_text()
     assert "CVE-2025-32463\tpublished\t" in details
     assert '"lessThan":"1.9.17p1"' in details
-    assert "CVE-2026-12345\tunindexed\t\t\t\tnot-in-local-details" in details
+    assert "CVE-2026-12345\tunindexed\t\t\t\tdetails-not-installed" in details
     assert "sudo-shell" in (run_dir / "success.tsv").read_text()
     assert "CVE-2025-32463 tested lab build\tunsupported\texplicit lab opt-in not supplied" in (
         run_dir / "coverage.tsv").read_text()
@@ -173,6 +173,40 @@ else:
         "--catalog-dir", str(duplicate_catalog))
     general_index = (next(general_runs.iterdir()) / "cve-index.tsv").read_text()
     assert "CVE-2025-32463\tpublished-general" in general_index
+    # Optional complete sidecar stays lazy and scans each touched gzip shard
+    # once, including multiple CVE candidates sharing a thousand-ID bucket.
+    import json
+    detail_catalog = base / 'complete-catalog'
+    shutil.copytree(ROOT / 'tests/fixtures/cve-details/catalog', detail_catalog)
+    detail_source = json.loads((detail_catalog / 'all-cve-details-source.json').read_text())
+    generation = detail_catalog / 'all-cve-details' / detail_source['shards_sha256']
+    (generation / '2021/1.tsv.gz').unlink()  # Unused payload must not be read.
+    detail_tools = base / 'detail-tools'
+    shutil.copytree(tools, detail_tools)
+    write(detail_tools / 'linpeas.sh', '#!/bin/sh\nprintf "CVE-2020-0001\\nCVE-2020-0002\\nCVE-2020-01000\\n"\n')
+    (detail_tools / 'linpeas.sh.sha256').write_text(hashlib.sha256((detail_tools / 'linpeas.sh').read_bytes()).hexdigest() + '\n')
+    gzip_marker = base / 'gzip-reads'
+    system_gzip = shutil.which('gzip')
+    assert system_gzip
+    write(fake / 'gzip', f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{gzip_marker}"\nexec "{system_gzip}" "$@"\n')
+    detail_runs = base / 'detail-runs'
+    detail_scan = run(ROOT / 'edamame-ng.sh', env, '--scan', '--offline', '--no-shell',
+                      '--output-dir', str(detail_runs), '--tool-dir', str(detail_tools), '--catalog-dir', str(detail_catalog))
+    detail_text = (next(detail_runs.iterdir()) / 'cve-details.tsv').read_text()
+    assert len(detail_text.splitlines()) == 4
+    assert 'CVE-2020-0001\tpublished\t' in detail_text and 'CVE-2020-01000\trejected\t' in detail_text
+    assert 'Conflicting ADP claim' in detail_text
+    assert len(gzip_marker.read_text().splitlines()) == 2
+    assert sum('/2020/0.tsv.gz' in line for line in gzip_marker.read_text().splitlines()) == 1
+    (generation / '2020/0.tsv.gz').unlink()
+    damaged_runs = base / 'damaged-details-runs'
+    damaged_scan = run(ROOT / 'edamame-ng.sh', env, '--scan', '--offline', '--no-shell',
+                       '--output-dir', str(damaged_runs), '--tool-dir', str(detail_tools), '--catalog-dir', str(detail_catalog))
+    damaged_text = (next(damaged_runs.iterdir()) / 'cve-details.tsv').read_text()
+    assert damaged_text.count('integrity-failed') == 2 and damaged_text.count('source-metadata-unreviewed') == 1
+    assert 'integrity checks' in damaged_scan.stderr
+    (fake / 'gzip').unlink()
+
     lab_runs = base / "lab-runs"
     run(ROOT / "edamame-ng.sh", denied_env, "--scan", "--no-shell",
         "--enable-cve-2025-32463-lab", "--output-dir", str(lab_runs),

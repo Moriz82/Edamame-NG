@@ -82,15 +82,16 @@ function Test-CveDetailsCatalog([string]$CatalogPath) {
     } catch { return $false }
 }
 
-function Get-CveDetailsLine([string]$CatalogPath, [string]$Id) {
+function Get-CveDetailsLine([string]$CatalogPath, [string]$Id, $CatalogValid = $null) {
     $index = Join-Path $CatalogPath 'local-eop-details.tsv'
-    $reviewState = 'not-in-local-details'
+    $reviewState = 'details-not-installed'
     if (Test-Path -LiteralPath $index -PathType Leaf) {
-        if (Test-CveDetailsCatalog $CatalogPath) {
+        if ($null -eq $CatalogValid) { $CatalogValid = Test-CveDetailsCatalog $CatalogPath }
+        if ($CatalogValid) {
             $member = @(Get-CatalogEntries $CatalogPath | Where-Object cve -eq $Id | Select-Object -First 1)
             if ($member.Count) {
                 foreach ($line in [IO.File]::ReadAllLines($index, [Text.Encoding]::UTF8)) {
-                    if ($line.StartsWith("$Id`t", [StringComparison]::Ordinal)) { return $line }
+                    if ($line.StartsWith("$Id`t", [StringComparison]::Ordinal)) { return "$line`t" }
                 }
             }
         } else { $reviewState = 'integrity-failed' }
@@ -99,7 +100,165 @@ function Get-CveDetailsLine([string]$CatalogPath, [string]$Id) {
     if ($state.EndsWith('-general', [StringComparison]::Ordinal)) {
         $state = $state.Substring(0, $state.Length - 8)
     }
-    return "$Id`t$state`t`t`t`t$reviewState"
+    return "$Id`t$state`t`t`t`t$reviewState`t"
+}
+
+function Get-AllCveDetailsCatalog([string]$CatalogPath) {
+    $result = @{ State = 'absent'; Root = ''; Shards = @{} }
+    $marker = Join-Path (Join-Path $CatalogPath 'all-cve-details') 'installed'
+    if (-not (Test-Path -LiteralPath $marker)) { return $result }
+    $result.State = 'invalid'
+    try {
+        $sourcePath = Join-Path $CatalogPath 'all-cve-details-source.json'
+        $basePath = Join-Path $CatalogPath 'cve-ids-source.json'
+        foreach ($path in @($marker, $sourcePath, $basePath, (Split-Path -Parent $marker))) {
+            if ((Get-Item -LiteralPath $path).Attributes -band [IO.FileAttributes]::ReparsePoint) { return $result }
+        }
+        if ((Get-Item -LiteralPath $marker).Length -ne 65 -or
+            (Get-Item -LiteralPath $sourcePath).Length -gt 65536 -or
+            (Get-Item -LiteralPath $basePath).Length -gt 65536) { return $result }
+        $expected = [IO.File]::ReadAllText($marker).Trim()
+        if ($expected -cnotmatch '^[0-9a-f]{64}$' -or
+            (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expected) { return $result }
+        $source = [IO.File]::ReadAllText($sourcePath) | ConvertFrom-Json
+        $base = [IO.File]::ReadAllText($basePath) | ConvertFrom-Json
+        if ($source.format_version -ne 1 -or $source.shards_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            $source.baseline_sha256 -cnotmatch '^[0-9a-f]{64}$' -or $source.index_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            $source.baseline_sha256 -cne $base.baseline_sha256 -or $source.index_sha256 -cne $base.index_sha256) { return $result }
+        $result.Root = Join-Path (Split-Path -Parent $marker) $source.shards_sha256
+        $manifest = Join-Path $result.Root 'shards.tsv'
+        foreach ($path in @($result.Root, $manifest)) {
+            if ((Get-Item -LiteralPath $path).Attributes -band [IO.FileAttributes]::ReparsePoint) { return $result }
+        }
+        if ((Get-Item -LiteralPath $manifest).Length -gt 16777216 -or
+            (Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash.ToLowerInvariant() -cne $source.shards_sha256) { return $result }
+        $lines = [IO.File]::ReadAllLines($manifest, [Text.Encoding]::ASCII)
+        if (-not $lines.Length -or $lines[0] -cne "path`tsha256`trows`tbytes`tuncompressed_bytes") { return $result }
+        [long]$total = 0
+        for ($i = 1; $i -lt $lines.Length; $i++) {
+            $fields = $lines[$i].Split([char]9)
+            if ($fields.Length -ne 5 -or $fields[0] -cnotmatch '^[0-9]{4}/[0-9]{1,16}\.tsv\.gz$' -or
+                $fields[1] -cnotmatch '^[0-9a-f]{64}$' -or $result.Shards.ContainsKey($fields[0])) { return $result }
+            foreach ($number in $fields[2..4]) { if ($number -cnotmatch '^[0-9]{1,9}$') { return $result } }
+            $entry = @{ Hash = $fields[1]; Rows = [int]$fields[2]; Bytes = [int]$fields[3]; Expanded = [int]$fields[4] }
+            if ($entry.Rows -lt 1 -or $entry.Rows -gt 1000 -or $entry.Bytes -lt 1 -or $entry.Bytes -gt 269484032 -or
+                $entry.Expanded -lt 1 -or $entry.Expanded -gt 268435456) { return $result }
+            $result.Shards[$fields[0]] = $entry
+            $total += $entry.Rows
+        }
+        if ($total -ne $source.record_count -or $result.Shards.Count -ne $source.shard_count) { return $result }
+        $result.State = 'valid'
+    } catch { $result.State = 'invalid' }
+    return $result
+}
+
+function Get-CveDetailBucket([string]$Id) {
+    if ($Id -cnotmatch '^CVE-[0-9]{4}-[0-9]{4,19}$') { throw 'Invalid CVE ID.' }
+    $suffix = $Id.Substring(9)
+    return $Id.Substring(4, 4) + '/' + $suffix.Substring(0, $suffix.Length - 3) + '.tsv.gz'
+}
+
+function Read-CveDetailShard([string]$Root, [string]$Relative, [hashtable]$Entry, [hashtable]$Wanted) {
+    $path = Join-Path $Root $Relative
+    foreach ($item in @($path, (Split-Path -Parent $path))) {
+        if ((Get-Item -LiteralPath $item).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Detail shard is a link.' }
+    }
+    if ((Get-Item -LiteralPath $path).Length -ne $Entry.Bytes -or
+        (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Entry.Hash) { throw 'Detail shard digest/size mismatch.' }
+    $found = @{}
+    $seen = @{}
+    $stream = [IO.File]::OpenRead($path)
+    $gzip = $null
+    try {
+        $gzip = New-Object IO.Compression.GZipStream($stream, [IO.Compression.CompressionMode]::Decompress)
+        $buffer = New-Object byte[] 8192
+        $line = New-Object Text.StringBuilder
+        $encoding = [Text.Encoding]::GetEncoding(20127, [Text.EncoderFallback]::ExceptionFallback, [Text.DecoderFallback]::ExceptionFallback)
+        [long]$expanded = 0
+        $lineNumber = 0
+        # StreamReader.ReadLine can allocate an unbounded row before validation.
+        # Fixed byte chunks cap row allocation before adding to the builder.
+        while (($length = $gzip.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $expanded += $length
+            if ($expanded -gt $Entry.Expanded) { throw 'Detail shard expanded size exceeded.' }
+            $chunk = $encoding.GetString($buffer, 0, $length)
+            $offset = 0
+            while ($offset -lt $chunk.Length) {
+                $newline = $chunk.IndexOf("`n", $offset, [StringComparison]::Ordinal)
+                $end = if ($newline -lt 0) { $chunk.Length } else { $newline }
+                if ($line.Length + $end - $offset -ge 16777216) { throw 'Detail row size exceeded.' }
+                [void]$line.Append($chunk, $offset, $end - $offset)
+                $offset = $end + 1
+                if ($newline -lt 0) { break }
+                $value = $line.ToString()
+                [void]$line.Clear()
+                $lineNumber++
+                if ($lineNumber -eq 1) {
+                    if ($value -cne "cve`tstate`tdescription`taffected_json`treferences_json`treview_state`tsource_json") { throw 'Invalid detail header.' }
+                    continue
+                }
+                $fields = $value.Split([char]9)
+                if ($fields.Length -ne 7 -or $lineNumber -gt 1001 -or
+                    $fields[0] -cnotmatch '^CVE-[0-9]{4}-[0-9]{4,19}$' -or
+                    $fields[1] -cnotmatch '^(published|rejected|reserved)$' -or
+                    $fields[5] -cne 'source-metadata-unreviewed' -or $value -cmatch '[\x00-\x08\x0b-\x1f\x7f]' -or
+                    (Get-CveDetailBucket $fields[0]) -cne $Relative -or $seen.ContainsKey($fields[0])) { throw 'Invalid detail row.' }
+                $seen[$fields[0]] = $true
+                if ($Wanted.ContainsKey($fields[0])) { $found[$fields[0]] = $value }
+            }
+        }
+        if ($line.Length -ne 0 -or $lineNumber - 1 -ne $Entry.Rows -or $expanded -ne $Entry.Expanded) { throw 'Detail shard count/size mismatch.' }
+    } finally {
+        if ($gzip) { $gzip.Dispose() }
+        $stream.Dispose()
+    }
+    return $found
+}
+
+function Get-CveDetailsLines([string]$CatalogPath, [string[]]$Ids) {
+    if (-not $Ids.Count) { return }
+    $catalog = Get-AllCveDetailsCatalog $CatalogPath
+    if ($catalog.State -eq 'absent') {
+        $valid = Test-CveDetailsCatalog $CatalogPath
+        foreach ($id in $Ids) { Get-CveDetailsLine $CatalogPath $id $valid }
+        return
+    }
+    $groups = @{}
+    foreach ($id in $Ids) {
+        $key = Get-CveDetailBucket $id
+        if (-not $groups.ContainsKey($key)) { $groups[$key] = @{} }
+        $groups[$key][$id] = $true
+    }
+    foreach ($key in @($groups.Keys | Sort-Object)) {
+        $found = @{}
+        $failed = $catalog.State -ne 'valid'
+        if (-not $failed -and $catalog.Shards.ContainsKey($key)) {
+            try { $found = Read-CveDetailShard $catalog.Root $key $catalog.Shards[$key] $groups[$key] }
+            catch { $failed = $true }
+        }
+        foreach ($id in @($groups[$key].Keys | Sort-Object)) {
+            if (-not $failed -and $found.ContainsKey($id)) { $found[$id]; continue }
+            $state = (Get-GeneralCveState $CatalogPath $id) -replace '-general$', ''
+            $review = if ($failed -or $state -ne 'unindexed') { 'integrity-failed' } else { 'not-in-dated-baseline' }
+            "$id`t$state`t`t`t`t$review`t"
+        }
+    }
+}
+
+function Get-SuggestedCves([string]$CapturePath, [hashtable]$Seen) {
+    $ids = @{}
+    foreach ($id in $Seen.Keys) {
+        $normalized = ([string]$id).ToUpperInvariant()
+        if ($normalized -cmatch '^CVE-[0-9]{4}-[0-9]{4,19}$') { $ids[$normalized] = $true }
+    }
+    foreach ($file in @('winpeas-output.txt', 'winpeas-binary-partial.txt', 'privesccheck-output.txt', 'sharphound-output.txt')) {
+        $path = Join-Path $CapturePath $file
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            Select-String -LiteralPath $path -Pattern 'CVE-[0-9]{4}-[0-9]{4,19}(?![0-9])' -AllMatches |
+                ForEach-Object { foreach ($match in $_.Matches) { $ids[$match.Value.ToUpperInvariant()] = $true } }
+        }
+    }
+    return @($ids.Keys | Sort-Object)
 }
 
 function Write-CveIndex([string]$CatalogPath, [string[]]$Suggested, [string]$Destination) {
@@ -111,7 +270,7 @@ function Write-CveIndex([string]$CatalogPath, [string[]]$Suggested, [string]$Des
         foreach ($item in @(Get-CatalogEntries $CatalogPath)) {
             if (-not $catalog.ContainsKey($item.cve)) { $catalog[$item.cve] = $item }
         }
-    } else {
+    } elseif (-not (Test-Path -LiteralPath (Join-Path $CatalogPath 'cve-ids') -PathType Container)) {
         Write-Warning 'Offline CVE catalog unavailable; retaining CVE.org links.'
     }
     $indexed = @('cve' + "`t" + 'status' + "`t" + 'platform' + "`t" + 'product' + "`t" + 'kev_date' + "`t" + 'reference')
@@ -130,7 +289,7 @@ function Write-CveIndex([string]$CatalogPath, [string[]]$Suggested, [string]$Des
 
 if ($Poc) {
     if ($Cve -or $CveDetails) { throw 'Choose one CVE query mode.' }
-    if ($Poc -cnotmatch '^CVE-[0-9]{4}-[0-9]{4,}$') { throw 'Invalid CVE ID.' }
+    if ($Poc -cnotmatch '^CVE-[0-9]{4}-[0-9]{4,19}$') { throw 'Invalid CVE ID.' }
     $manifest = Join-Path $CatalogDir 'poc_refs.tsv'
     if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { throw 'Offline PoC manifest unavailable.' }
     "cve`tstatus`tsource`tpath`tsha256`treview_state"
@@ -157,18 +316,21 @@ if ($Poc) {
 
 if ($CveDetails) {
     if ($Cve) { throw 'Choose one CVE query mode.' }
-    if ($CveDetails -cnotmatch '^CVE-[0-9]{4}-[0-9]{4,}$') { throw 'Invalid CVE ID.' }
-    if ((Test-Path -LiteralPath (Join-Path $CatalogDir 'local-eop-details.tsv') -PathType Leaf) -and
-        -not (Test-CveDetailsCatalog $CatalogDir)) { throw 'Offline CVE details failed integrity checks.' }
-    "cve`tstate`tdescription`taffected_json`treferences_json`treview_state"
-    Get-CveDetailsLine $CatalogDir $CveDetails
+    if ($CveDetails -cnotmatch '^CVE-[0-9]{4}-[0-9]{4,19}$') { throw 'Invalid CVE ID.' }
+    "cve`tstate`tdescription`taffected_json`treferences_json`treview_state`tsource_json"
+    $lines = @(Get-CveDetailsLines $CatalogDir @($CveDetails))
+    $lines
+    if (@($lines | Where-Object { ($_ -split "`t")[5] -eq 'integrity-failed' }).Count) {
+        throw 'Offline CVE details failed integrity checks.'
+    }
     return
 }
 
 if ($Cve) {
-    if ($Cve -cnotmatch '^CVE-[0-9]{4}-[0-9]{4,}$') { throw 'Invalid CVE ID.' }
+    if ($Cve -cnotmatch '^CVE-[0-9]{4}-[0-9]{4,19}$') { throw 'Invalid CVE ID.' }
     if (-not (Test-Path -LiteralPath (Join-Path $CatalogDir 'local-eop.tsv') -PathType Leaf) -and
-        -not (Test-Path -LiteralPath (Join-Path $CatalogDir 'curated-eop.tsv') -PathType Leaf)) {
+        -not (Test-Path -LiteralPath (Join-Path $CatalogDir 'curated-eop.tsv') -PathType Leaf) -and
+        -not (Test-Path -LiteralPath (Join-Path $CatalogDir 'cve-ids') -PathType Container)) {
         throw 'Offline catalog unavailable.'
     }
     'cve' + "`t" + 'status' + "`t" + 'platform' + "`t" + 'product' + "`t" + 'kev_date' + "`t" + 'reference'
@@ -1191,15 +1353,7 @@ if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Edamame-NG\Lab\WeakService') {
     }
 }
 
-$suggestedCves = @()
-foreach ($file in @('winpeas-output.txt', 'privesccheck-output.txt')) {
-    $path = Join-Path $capture $file
-    if (Test-Path -LiteralPath $path) {
-        $suggestedCves += Select-String -LiteralPath $path -Pattern 'CVE-[0-9]{4}-[0-9]{4,}' -AllMatches |
-            ForEach-Object { $_.Matches.Value }
-    }
-}
-$suggestedCves = @($suggestedCves | Sort-Object -Unique)
+$suggestedCves = @(Get-SuggestedCves $capture $liveCves)
 if ($suggestedCves.Count) { Write-Finding 'cve-candidates' "$($suggestedCves.Count) suggested; review exact build and patch status" }
 
 $recipe = $null
@@ -1264,10 +1418,11 @@ if ($sharpCollectedZip -and (Test-Path -LiteralPath $sharpCollectedZip.FullName)
 $suggestedCves | ForEach-Object { "$_`thttps://www.cve.org/CVERecord?id=$_" } |
     Set-Content -LiteralPath (Join-Path $runDir 'cve-candidates.tsv') -Encoding ASCII
 Write-CveIndex $CatalogDir $suggestedCves (Join-Path $runDir 'cve-index.tsv')
-$detailLines = @("cve`tstate`tdescription`taffected_json`treferences_json`treview_state")
-if ((Test-Path -LiteralPath (Join-Path $CatalogDir 'local-eop-details.tsv') -PathType Leaf) -and
-    -not (Test-CveDetailsCatalog $CatalogDir)) { Write-Warning 'Offline CVE details failed integrity checks; withholding details.' }
-foreach ($id in $suggestedCves) { $detailLines += Get-CveDetailsLine $CatalogDir $id }
+$detailLines = @("cve`tstate`tdescription`taffected_json`treferences_json`treview_state`tsource_json")
+$detailLines += @(Get-CveDetailsLines $CatalogDir $suggestedCves)
+if (@($detailLines | Where-Object { ($_ -split "`t")[5] -eq 'integrity-failed' }).Count) {
+    Write-Warning 'Offline CVE details failed integrity checks; withholding affected details.'
+}
 $detailLines | Set-Content -LiteralPath (Join-Path $runDir 'cve-details.tsv') -Encoding UTF8
 Write-Host '[SAVED] findings.tsv, coverage.tsv, attempts.tsv, tools.tsv'
 

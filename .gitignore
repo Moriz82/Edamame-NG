@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 edamame-ng-runs/
+catalog/all-cve-details/**/*.tsv.gz
+catalog/all-cve-details/installed
+catalog/.cve-build-*/

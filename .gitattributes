@@ -2,3 +2,6 @@ catalog/*.json text eol=lf
 catalog/*.tsv text eol=lf
 catalog/cve-ids/*.tsv text eol=lf
 catalog/pocs/CVE-2025-32463/sudo-chwoot.sh text eol=lf
+catalog/all-cve-details/**/shards.tsv text eol=lf
+tests/fixtures/cve-details/** text eol=lf
+tests/fixtures/cve-details/**/*.gz binary

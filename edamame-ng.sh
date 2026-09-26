@@ -23,6 +23,8 @@ QUERY_MODES=0
 POC_QUERY=0
 CVE_DETAILS_QUERY=0
 DETAILS_CATALOG_STATE=''
+ALL_DETAILS_STATE=''
+ALL_DETAILS_ROOT=''
 LAB_CVE_ENABLED=0
 CVE_SUDO='/opt/edamame-vuln-sudo/bin/sudo'
 CVE_SUDO_SHA='8c18093b760250d35b1ebcc5ecd12b33d17b8a2cfc27f170bbb4f62b674702cd'
@@ -91,12 +93,12 @@ cve_lookup() {
 }
 
 cve_details_lookup() {
-  local id=$1 row state year review_state=not-in-local-details member
+  local id=$1 row state year review_state=details-not-installed member
   member=''
   member=$(awk -F '\t' -v id="$id" 'FNR>1 && $1==id {print 1; exit}' "$CVE_BASE" "$CVE_CURATED")
   if [[ -n $member ]] && verify_details_catalog; then
     row=$(awk -F '\t' -v id="$id" 'FNR>1 && $1==id {print; exit}' "$CATALOG_DIR/local-eop-details.tsv")
-    if [[ -n $row ]]; then printf '%s\n' "$row"; return; fi
+    if [[ -n $row ]]; then printf '%s\t\n' "$row"; return; fi
   fi
   if [[ $DETAILS_CATALOG_STATE == invalid ]]; then review_state=integrity-failed; fi
   year=${id:4:4}
@@ -105,7 +107,8 @@ cve_details_lookup() {
     state=$(awk -F '\t' -v id="$id" 'FNR>1 && $1==id {print $2; exit}' "$CATALOG_DIR/cve-ids/$year.tsv")
   fi
   [[ -n $state ]] || state=unindexed
-  printf '%s\t%s\t\t\t\t%s\n' "$id" "$state" "$review_state"
+  printf '%s\t%s\t\t\t\t%s\t\n' "$id" "$state" "$review_state"
+  [[ $review_state != integrity-failed ]]
 }
 
 sha256_file() {
@@ -148,6 +151,127 @@ verify_details_catalog() {
   DETAILS_CATALOG_STATE=valid
 }
 
+cve_detail_status() {
+  local id=$1 review=$2 state=''
+  if [[ -f $CATALOG_DIR/cve-ids/${id:4:4}.tsv ]]; then
+    state=$(awk -F '\t' -v id="$id" 'NR>1 && $1==id {print $2; exit}' "$CATALOG_DIR/cve-ids/${id:4:4}.tsv")
+  fi
+  printf '%s\t%s\t\t\t\t%s\t\n' "$id" "${state:-unindexed}" "$review"
+}
+
+# These small manifests are read only when details are requested. An installed
+# marker binds the source JSON, which binds the immutable generation manifest.
+verify_all_details_catalog() {
+  local marker=$CATALOG_DIR/all-cve-details/installed source=$CATALOG_DIR/all-cve-details-source.json
+  local base=$CATALOG_DIR/cve-ids-source.json expected generation baseline index_baseline index_hash base_hash count shard_count
+  [[ $ALL_DETAILS_STATE == valid ]] && return 0
+  [[ $ALL_DETAILS_STATE == invalid ]] && return 1
+  [[ -e $marker || -L $marker ]] || { ALL_DETAILS_STATE=absent; return 1; }
+  ALL_DETAILS_STATE=invalid
+  [[ -f $marker && ! -L $marker && -f $source && ! -L $source && -f $base && ! -L $base ]] || return 1
+  [[ ! -L $CATALOG_DIR/all-cve-details ]] || return 1
+  [[ $(wc -c < "$marker") -eq 65 && $(wc -c < "$source") -lt 65536 && $(wc -c < "$base") -lt 65536 ]] || return 1
+  IFS= read -r expected < "$marker"
+  [[ $expected =~ ^[0-9a-f]{64}$ && $(sha256_file "$source") == "$expected" ]] || return 1
+  generation=$(sed -nE 's/^[[:space:]]*"shards_sha256":[[:space:]]*"([0-9a-f]{64})",?[[:space:]]*$/\1/p' "$source")
+  baseline=$(sed -nE 's/^[[:space:]]*"baseline_sha256":[[:space:]]*"([0-9a-f]{64})",?[[:space:]]*$/\1/p' "$source")
+  index_baseline=$(sed -nE 's/^[[:space:]]*"baseline_sha256":[[:space:]]*"([0-9a-f]{64})",?[[:space:]]*$/\1/p' "$base")
+  index_hash=$(sed -nE 's/^[[:space:]]*"index_sha256":[[:space:]]*"([0-9a-f]{64})",?[[:space:]]*$/\1/p' "$source")
+  base_hash=$(sed -nE 's/^[[:space:]]*"index_sha256":[[:space:]]*"([0-9a-f]{64})",?[[:space:]]*$/\1/p' "$base")
+  count=$(sed -nE 's/^[[:space:]]*"record_count":[[:space:]]*([0-9]+),?[[:space:]]*$/\1/p' "$source")
+  shard_count=$(sed -nE 's/^[[:space:]]*"shard_count":[[:space:]]*([0-9]+),?[[:space:]]*$/\1/p' "$source")
+  [[ $shard_count =~ ^[0-9]{1,9}$ ]] || return 1
+  [[ $generation =~ ^[0-9a-f]{64}$ && $baseline =~ ^[0-9a-f]{64}$ && $index_hash =~ ^[0-9a-f]{64}$ && $count =~ ^[0-9]{1,9}$ ]] || return 1
+  [[ $baseline == "$index_baseline" && $index_hash == "$base_hash" ]] || return 1
+  grep -qE '^[[:space:]]*"format_version":[[:space:]]*1,?$' "$source" || return 1
+  ALL_DETAILS_ROOT=$CATALOG_DIR/all-cve-details/$generation
+  [[ -d $ALL_DETAILS_ROOT && ! -L $ALL_DETAILS_ROOT && -f $ALL_DETAILS_ROOT/shards.tsv && ! -L $ALL_DETAILS_ROOT/shards.tsv ]] || return 1
+  [[ $(wc -c < "$ALL_DETAILS_ROOT/shards.tsv") -le 16777216 && $(sha256_file "$ALL_DETAILS_ROOT/shards.tsv") == "$generation" ]] || return 1
+  LC_ALL=C awk -F '\t' -v total="$count" -v shards="$shard_count" '
+    NR==1 {if ($0!="path\tsha256\trows\tbytes\tuncompressed_bytes") bad=1; next}
+    {split($1,p,"/"); split(p[2],s,".");
+     if (NF!=5 || length(p[1])!=4 || p[1]!~/^[0-9]+$/ || length(s[1])<1 || length(s[1])>16 ||
+         s[1]!~/^[0-9]+$/ || $1!=p[1] "/" s[1] ".tsv.gz" || seen[$1]++ ||
+         length($2)!=64 || $2!~/^[0-9a-f]+$/ || $3!~/^[0-9]+$/ || $3<1 || $3>1000 ||
+         $4!~/^[0-9]+$/ || $4<1 || $4>269484032 || $5!~/^[0-9]+$/ || $5<1 || $5>268435456) bad=1;
+     n+=$3}
+    END {if (bad || n!=total || NR-1!=shards) exit 1}' "$ALL_DETAILS_ROOT/shards.tsv" || return 1
+  ALL_DETAILS_STATE=valid
+}
+
+# Input is a list of exact IDs. Each requested shard is hashed/decompressed once
+# per batch. Candidate output stays in a private temporary file until the whole
+# touched shard passes gzip, size, row-count, route and duplicate checks.
+cve_details_batch() {
+  local temporary id suffix key previous='' failed=0 entry digest count bytes expanded asset actual
+  temporary=$(mktemp -d "${TMPDIR:-/tmp}/edamame-details.XXXXXXXX") || return 1
+  : > "$temporary/requests"
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    if [[ ! $id =~ ^CVE-[0-9]{4}-[0-9]{4,19}$ ]]; then failed=1; continue; fi
+    suffix=${id:9}
+    printf '%s/%s.tsv.gz\t%s\n' "${id:4:4}" "${suffix:0:${#suffix}-3}" "$id" >> "$temporary/requests"
+  done
+  if [[ ! -s $temporary/requests ]]; then rm -rf -- "$temporary"; return "$failed"; fi
+  verify_all_details_catalog || true
+  if [[ $ALL_DETAILS_STATE == absent ]]; then
+    if [[ -f $CATALOG_DIR/local-eop-details.tsv ]]; then verify_details_catalog || true; fi
+    while IFS=$'\t' read -r key id; do cve_details_lookup "$id" || failed=1; done < "$temporary/requests"
+  elif [[ $ALL_DETAILS_STATE == invalid ]]; then
+    while IFS=$'\t' read -r key id; do
+      cve_detail_status "$id" integrity-failed
+    done < "$temporary/requests"
+    failed=1
+  else
+    LC_ALL=C sort -u "$temporary/requests" > "$temporary/sorted"
+    while IFS=$'\t' read -r key id; do
+      [[ $key != "$previous" ]] || continue
+      previous=$key
+      awk -F '\t' -v key="$key" '$1==key {print $2}' "$temporary/sorted" > "$temporary/ids"
+      entry=$(awk -F '\t' -v key="$key" 'NR>1 && $1==key {print; exit}' "$ALL_DETAILS_ROOT/shards.tsv")
+      if [[ -z $entry ]]; then
+        # No shard is normal only when every requested ID is absent from the
+        # dated ID index. An indexed ID without its declared data fails closed.
+        while IFS= read -r id; do
+          actual=$(awk -F '\t' -v id="$id" '$1==id {print $2; exit}' "$CATALOG_DIR/cve-ids/${id:4:4}.tsv" 2>/dev/null)
+          if [[ -n $actual ]]; then
+            printf '%s\t%s\t\t\t\tintegrity-failed\t\n' "$id" "$actual"; failed=1
+          else printf '%s\tunindexed\t\t\t\tnot-in-dated-baseline\t\n' "$id"; fi
+        done < "$temporary/ids"
+        continue
+      fi
+      IFS=$'\t' read -r key digest count bytes expanded <<< "$entry"
+      asset=$ALL_DETAILS_ROOT/$key
+      if [[ -f $asset && ! -L $asset && ! -L ${asset%/*} && $(wc -c < "$asset") -eq $bytes && $(sha256_file "$asset") == "$digest" ]] &&
+        gzip -dc -- "$asset" | head -c "$((expanded+1))" | fold -b -w 16777216 | LC_ALL=C awk -F '\t' -v key="$key" -v rows="$count" -v size="$expanded" '
+          FILENAME!="-" {wanted[$1]=1; next}
+          FNR==1 {if ($0!="cve\tstate\tdescription\taffected_json\treferences_json\treview_state\tsource_json") bad=1; bytes=length($0)+1; next}
+          {bytes+=length($0)+1; count++; split($1,p,"-"); suffix=p[3];
+           if (NF!=7 || length($0)+1>16777216 || count>1000 || bytes>size || p[1]!="CVE" ||
+               length(p[2])!=4 || p[2]!~/^[0-9]+$/ || length(suffix)<4 || length(suffix)>19 || suffix!~/^[0-9]+$/ ||
+               p[2] "/" substr(suffix,1,length(suffix)-3) ".tsv.gz"!=key || seen[$1]++ ||
+               $2!~/^(published|rejected|reserved)$/ || $6!="source-metadata-unreviewed" || $0~/[^\t -~]/) {bad=1; exit 1}
+           if ($1 in wanted) {print; found[$1]=1}}
+          END {if (bad || count!=rows || bytes!=size) exit 1}' "$temporary/ids" - > "$temporary/matches"; then
+        cat "$temporary/matches"
+        while IFS= read -r id; do
+          if ! awk -F '\t' -v id="$id" '$1==id {found=1} END {exit !found}' "$temporary/matches"; then
+            actual=$(awk -F '\t' -v id="$id" '$1==id {print $2; exit}' "$CATALOG_DIR/cve-ids/${id:4:4}.tsv" 2>/dev/null)
+            if [[ -n $actual ]]; then
+              printf '%s\t%s\t\t\t\tintegrity-failed\t\n' "$id" "$actual"; failed=1
+            else printf '%s\tunindexed\t\t\t\tnot-in-dated-baseline\t\n' "$id"; fi
+          fi
+        done < "$temporary/ids"
+      else
+        while IFS= read -r id; do cve_detail_status "$id" integrity-failed; done < "$temporary/ids"
+        failed=1
+      fi
+    done < "$temporary/sorted"
+  fi
+  rm -rf -- "$temporary"
+  return "$failed"
+}
+
 trusted_root_file() {
   local path=$1 mode
   [[ $path == /* && -f $path ]] || return 1
@@ -162,7 +286,7 @@ trusted_root_file() {
 }
 
 if [[ -n $CVE_QUERY ]]; then
-  [[ $CVE_QUERY =~ ^CVE-[0-9]{4}-[0-9]{4,}$ ]] || { printf 'Invalid CVE ID.\n' >&2; exit 2; }
+  [[ $CVE_QUERY =~ ^CVE-[0-9]{4}-[0-9]{4,19}$ ]] || { printf 'Invalid CVE ID.\n' >&2; exit 2; }
   if ((POC_QUERY)); then
     [[ -f $CATALOG_DIR/poc_refs.tsv ]] || { printf 'Offline PoC manifest unavailable.\n' >&2; exit 2; }
     printf 'cve\tstatus\tsource\tpath\tsha256\treview_state\n'
@@ -181,14 +305,13 @@ if [[ -n $CVE_QUERY ]]; then
     done < <(tail -n +2 "$CATALOG_DIR/poc_refs.tsv")
     ((poc_found)) || printf '%s\tnot-indexed\t\t\t\t\n' "$CVE_QUERY"
   elif ((CVE_DETAILS_QUERY)); then
-    if [[ -f $CATALOG_DIR/local-eop-details.tsv ]] && ! verify_details_catalog; then
+    printf 'cve\tstate\tdescription\taffected_json\treferences_json\treview_state\tsource_json\n'
+    if ! cve_details_batch <<< "$CVE_QUERY"; then
       printf 'Offline CVE details failed integrity checks.\n' >&2
       exit 2
     fi
-    printf 'cve\tstate\tdescription\taffected_json\treferences_json\treview_state\n'
-    cve_details_lookup "$CVE_QUERY"
   else
-    [[ $CVE_BASE != /dev/null || $CVE_CURATED != /dev/null ]] || { printf 'Offline catalog unavailable.\n' >&2; exit 2; }
+    [[ $CVE_BASE != /dev/null || $CVE_CURATED != /dev/null || -d $CATALOG_DIR/cve-ids ]] || { printf 'Offline catalog unavailable.\n' >&2; exit 2; }
     printf 'cve\tstatus\tplatform\tproduct\tkev_date\treference\n'
     cve_lookup "$CVE_QUERY" any
   fi
@@ -622,19 +745,16 @@ while IFS= read -r cve; do
   [[ -n $cve ]] && printf '%s\thttps://www.cve.org/CVERecord?id=%s\n' "$cve" "$cve"
 done < "$cve_tmp" > "$RUN_DIR/cve-candidates.tsv"
 printf 'cve\tstatus\tplatform\tproduct\tkev_date\treference\n' > "$RUN_DIR/cve-index.tsv"
-if [[ $CVE_BASE == /dev/null && $CVE_CURATED == /dev/null ]]; then
+if [[ $CVE_BASE == /dev/null && $CVE_CURATED == /dev/null && ! -d $CATALOG_DIR/cve-ids ]]; then
   printf '[WARN] Offline CVE catalog unavailable; retaining CVE.org links.\n' >&2
 fi
 while IFS= read -r cve; do
   [[ -n $cve ]] && cve_lookup "$cve" linux >> "$RUN_DIR/cve-index.tsv"
 done < "$cve_tmp"
-printf 'cve\tstate\tdescription\taffected_json\treferences_json\treview_state\n' > "$RUN_DIR/cve-details.tsv"
-if [[ -f $CATALOG_DIR/local-eop-details.tsv ]] && ! verify_details_catalog; then
-  printf '[WARN] Offline CVE details failed integrity checks; withholding details.\n' >&2
+printf 'cve\tstate\tdescription\taffected_json\treferences_json\treview_state\tsource_json\n' > "$RUN_DIR/cve-details.tsv"
+if ! cve_details_batch < "$cve_tmp" >> "$RUN_DIR/cve-details.tsv"; then
+  printf '[WARN] Offline CVE details failed integrity checks; withholding affected details.\n' >&2
 fi
-while IFS= read -r cve; do
-  [[ -n $cve ]] && cve_details_lookup "$cve" >> "$RUN_DIR/cve-details.tsv"
-done < "$cve_tmp"
 printf '[SAVED] findings.tsv, coverage.tsv, attempts.tsv, tools.tsv\n'
 
 if [[ -n $selected ]]; then
