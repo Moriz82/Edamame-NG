@@ -188,7 +188,7 @@ if [[ -n $CVE_QUERY ]]; then
     printf 'cve\tstate\tdescription\taffected_json\treferences_json\treview_state\n'
     cve_details_lookup "$CVE_QUERY"
   else
-    [[ -f $CATALOG_DIR/local-eop.tsv ]] || { printf 'Offline catalog unavailable.\n' >&2; exit 2; }
+    [[ $CVE_BASE != /dev/null || $CVE_CURATED != /dev/null ]] || { printf 'Offline catalog unavailable.\n' >&2; exit 2; }
     printf 'cve\tstatus\tplatform\tproduct\tkev_date\treference\n'
     cve_lookup "$CVE_QUERY" any
   fi
@@ -622,14 +622,12 @@ while IFS= read -r cve; do
   [[ -n $cve ]] && printf '%s\thttps://www.cve.org/CVERecord?id=%s\n' "$cve" "$cve"
 done < "$cve_tmp" > "$RUN_DIR/cve-candidates.tsv"
 printf 'cve\tstatus\tplatform\tproduct\tkev_date\treference\n' > "$RUN_DIR/cve-index.tsv"
-if [[ -f $CATALOG_DIR/local-eop.tsv ]]; then
-  while IFS= read -r cve; do
-    [[ -n $cve ]] && cve_lookup "$cve" linux >> "$RUN_DIR/cve-index.tsv"
-  done < "$cve_tmp"
-else
+if [[ $CVE_BASE == /dev/null && $CVE_CURATED == /dev/null ]]; then
   printf '[WARN] Offline CVE catalog unavailable; retaining CVE.org links.\n' >&2
-  awk '{print $1 "\tunindexed\t\t\t\thttps://www.cve.org/CVERecord?id=" $1}' "$cve_tmp" >> "$RUN_DIR/cve-index.tsv"
 fi
+while IFS= read -r cve; do
+  [[ -n $cve ]] && cve_lookup "$cve" linux >> "$RUN_DIR/cve-index.tsv"
+done < "$cve_tmp"
 printf 'cve\tstate\tdescription\taffected_json\treferences_json\treview_state\n' > "$RUN_DIR/cve-details.tsv"
 if [[ -f $CATALOG_DIR/local-eop-details.tsv ]] && ! verify_details_catalog; then
   printf '[WARN] Offline CVE details failed integrity checks; withholding details.\n' >&2

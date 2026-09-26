@@ -211,6 +211,9 @@ with tempfile.TemporaryDirectory(prefix="edamame-catalog-") as root:
     curated_only = work / 'curated-only'
     shutil.copytree(ROOT / 'catalog', curated_only)
     (curated_only / 'local-eop.tsv').unlink()
+    assert 'indexed-review-only\tlinux\tglibc' in run(
+        ["bash", "edamame-ng.sh", "--cve", "CVE-2023-4911",
+         "--catalog-dir", str(curated_only)], env).stdout
     assert 'source-metadata-unreviewed' in run(
         ["bash", "edamame-ng.sh", "--cve-details", "CVE-2023-4911",
          "--catalog-dir", str(curated_only)], env).stdout
@@ -218,6 +221,9 @@ with tempfile.TemporaryDirectory(prefix="edamame-catalog-") as root:
         assert 'source-metadata-unreviewed' in run(
             [str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
              "-CveDetails", "CVE-2023-4911", "-CatalogDir", str(curated_only)], env).stdout
+        assert 'indexed-review-only\tlinux\tglibc' in run(
+            [str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
+             "-Cve", "CVE-2023-4911", "-CatalogDir", str(curated_only)], env).stdout
     (copied / "curated-eop.tsv").unlink()
     assert "published-general" in run(["bash", "edamame-ng.sh", "--cve", "CVE-2023-4911",
                                "--catalog-dir", str(copied)], env).stdout

@@ -105,7 +105,9 @@ function Get-CveDetailsLine([string]$CatalogPath, [string]$Id) {
 function Write-CveIndex([string]$CatalogPath, [string[]]$Suggested, [string]$Destination) {
     $catalog = @{}
     $indexPath = Join-Path $CatalogPath 'local-eop.tsv'
-    if (Test-Path -LiteralPath $indexPath -PathType Leaf) {
+    $curatedPath = Join-Path $CatalogPath 'curated-eop.tsv'
+    if ((Test-Path -LiteralPath $indexPath -PathType Leaf) -or
+        (Test-Path -LiteralPath $curatedPath -PathType Leaf)) {
         foreach ($item in @(Get-CatalogEntries $CatalogPath)) {
             if (-not $catalog.ContainsKey($item.cve)) { $catalog[$item.cve] = $item }
         }
@@ -165,7 +167,8 @@ if ($CveDetails) {
 
 if ($Cve) {
     if ($Cve -cnotmatch '^CVE-[0-9]{4}-[0-9]{4,}$') { throw 'Invalid CVE ID.' }
-    if (-not (Test-Path -LiteralPath (Join-Path $CatalogDir 'local-eop.tsv') -PathType Leaf)) {
+    if (-not (Test-Path -LiteralPath (Join-Path $CatalogDir 'local-eop.tsv') -PathType Leaf) -and
+        -not (Test-Path -LiteralPath (Join-Path $CatalogDir 'curated-eop.tsv') -PathType Leaf)) {
         throw 'Offline catalog unavailable.'
     }
     'cve' + "`t" + 'status' + "`t" + 'platform' + "`t" + 'product' + "`t" + 'kev_date' + "`t" + 'reference'

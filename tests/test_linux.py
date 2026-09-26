@@ -159,6 +159,20 @@ else:
         "--catalog-dir", str(duplicate_catalog))
     duplicate_index = (next(duplicate_runs.iterdir()) / "cve-index.tsv").read_text()
     assert "CVE-2025-32463\tindexed-review-only\tlinux\tSudo" in duplicate_index
+    (duplicate_catalog / "local-eop.tsv").unlink()
+    curated_runs = base / "curated-runs"
+    run(ROOT / "edamame-ng.sh", env, "--scan", "--no-shell",
+        "--output-dir", str(curated_runs), "--tool-dir", str(tools),
+        "--catalog-dir", str(duplicate_catalog))
+    curated_index = (next(curated_runs.iterdir()) / "cve-index.tsv").read_text()
+    assert "CVE-2023-4911\tindexed-review-only\tlinux\tglibc" in curated_index
+    (duplicate_catalog / "curated-eop.tsv").unlink()
+    general_runs = base / "general-runs"
+    run(ROOT / "edamame-ng.sh", env, "--scan", "--no-shell",
+        "--output-dir", str(general_runs), "--tool-dir", str(tools),
+        "--catalog-dir", str(duplicate_catalog))
+    general_index = (next(general_runs.iterdir()) / "cve-index.tsv").read_text()
+    assert "CVE-2025-32463\tpublished-general" in general_index
     lab_runs = base / "lab-runs"
     run(ROOT / "edamame-ng.sh", denied_env, "--scan", "--no-shell",
         "--enable-cve-2025-32463-lab", "--output-dir", str(lab_runs),

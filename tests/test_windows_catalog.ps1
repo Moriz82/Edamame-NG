@@ -38,6 +38,24 @@ foreach ($name in @('Get-CatalogEntries', 'Get-GeneralCveState', 'Write-CveIndex
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $testRoot | Out-Null
 try {
+    $curatedOnly = Join-Path $testRoot 'curated-only'
+    Copy-Item -LiteralPath (Join-Path $root 'catalog') -Destination $curatedOnly -Recurse
+    Remove-Item -LiteralPath (Join-Path $curatedOnly 'local-eop.tsv')
+    $curatedQuery = @(& $source -Cve 'CVE-2023-4911' -CatalogDir $curatedOnly)
+    if ($curatedQuery[1] -notmatch 'indexed-review-only\tlinux\tglibc') {
+        throw 'Curated-only direct lookup failed'
+    }
+    $curatedIndex = Join-Path $testRoot 'curated-index.tsv'
+    Write-CveIndex $curatedOnly @('CVE-2023-4911') $curatedIndex
+    $curatedRow = @(Import-Csv -LiteralPath $curatedIndex -Delimiter "`t")[0]
+    if ($curatedRow.status -ne 'platform-mismatch' -or $curatedRow.product -ne 'glibc') {
+        throw 'Curated-only scan index failed'
+    }
+    Remove-Item -LiteralPath (Join-Path $curatedOnly 'curated-eop.tsv')
+    $generalIndex = Join-Path $testRoot 'general-index.tsv'
+    Write-CveIndex $curatedOnly @('CVE-2023-4911') $generalIndex
+    $generalRow = @(Import-Csv -LiteralPath $generalIndex -Delimiter "`t")[0]
+    if ($generalRow.status -ne 'published-general') { throw 'General CVE fallback failed' }
     $tampered = Join-Path $testRoot 'tampered'
     Copy-Item -LiteralPath (Join-Path $root 'catalog') -Destination $tampered -Recurse
     Get-ChildItem -LiteralPath $tampered -Recurse -File | ForEach-Object { $_.IsReadOnly = $false }
