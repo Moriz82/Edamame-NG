@@ -5,7 +5,7 @@ param(
     [Parameter(ParameterSetName = 'Scan')][switch]$Scan,
     [Parameter(ParameterSetName = 'Resume')][switch]$Resume,
     [Parameter(ParameterSetName = 'Resume')][string]$RunId,
-    [string]$OutputDir = (Join-Path $env:LOCALAPPDATA 'Edamame-NG\runs'),
+    [string]$OutputDir,
     [string]$ToolDir,
     [string]$CatalogDir,
     [string]$Cve,
@@ -23,7 +23,16 @@ param(
 $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrWhiteSpace($CatalogDir)) { $CatalogDir = Join-Path $PSScriptRoot 'catalog' }
 $hostName = $env:COMPUTERNAME
-$cacheBase = Join-Path $env:LOCALAPPDATA 'Edamame-NG\cache'
+$localBase = $env:LOCALAPPDATA
+if ([string]::IsNullOrWhiteSpace($localBase)) {
+    $localBase = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+}
+if ([string]::IsNullOrWhiteSpace($localBase)) {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $localBase = Join-Path ([IO.Path]::GetTempPath()) ("Edamame-NG-$identity")
+}
+if ([string]::IsNullOrWhiteSpace($OutputDir)) { $OutputDir = Join-Path $localBase 'Edamame-NG\runs' }
+$cacheBase = Join-Path $localBase 'Edamame-NG\cache'
 $runDir = $null
 $weakServiceEvidence = $null
 

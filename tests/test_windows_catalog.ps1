@@ -5,6 +5,17 @@ $tokens = $null
 $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($source, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw "PowerShell parse failed: $errors" }
+$originalLocalAppData = $env:LOCALAPPDATA
+try {
+    Remove-Item Env:LOCALAPPDATA -ErrorAction SilentlyContinue
+    $missingEnvQuery = @(& $source -Cve 'CVE-2021-44228')
+    if ($missingEnvQuery.Count -lt 2 -or $missingEnvQuery[1] -notmatch 'published-general') {
+        throw 'Direct lookup failed without LOCALAPPDATA'
+    }
+} finally {
+    if ($null -eq $originalLocalAppData) { Remove-Item Env:LOCALAPPDATA -ErrorAction SilentlyContinue }
+    else { $env:LOCALAPPDATA = $originalLocalAppData }
+}
 if (-not $env:LOCALAPPDATA) { $env:LOCALAPPDATA = [IO.Path]::GetTempPath() }
 $directCve = @(& $source -Cve 'CVE-2021-36934')
 if ($directCve.Count -lt 2 -or $directCve[1] -notmatch 'indexed-review-only\twindows') {

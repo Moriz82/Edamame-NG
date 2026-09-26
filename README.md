@@ -90,7 +90,7 @@ $destination = Join-Path (Get-Location).Path 'full-cve-catalog-2026-09-25'
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Edamame-NG.ps1 -CatalogDir (Join-Path $destination 'catalog') -CveDetails CVE-2021-44228
 ```
 
-The ZIP extraction step uses .NET's ZIP library; native full-pack ZIP installation on PowerShell 3 has not been tested. The extracted pack was completely verified after ZIP extraction on Linux. A catalog downloaded from another source needs its own integrity and provenance review.
+The ZIP extraction step uses .NET's ZIP library. A networkless native PowerShell 3 guest extracted the release ZIP into an empty directory, verified all 595 shard hashes and the 397,443-record index, and passed direct queries and a fixture scan. A catalog downloaded from another source needs its own integrity and provenance review.
 
 Build the pack from the **2026-09-25 baseline asset** that matches the bundled index. This is a development-time local operation; it makes no network requests. Allow space for the outer ZIP, temporary inner ZIP, staged gzip payload, and any previous generation. The builder refuses a different baseline against an existing catalog. An installed pack can be rebuilt in place only with identical source provenance, including the baseline filename. For a new baseline or changed provenance, build into a fresh catalog and review the complete replacement.
 
