@@ -19,7 +19,10 @@ OFFLINE=0
 FINISH_BG_ENUM=0
 CATALOG_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/catalog"
 CVE_QUERY=''
+QUERY_MODES=0
 POC_QUERY=0
+CVE_DETAILS_QUERY=0
+DETAILS_CATALOG_STATE=''
 LAB_CVE_ENABLED=0
 CVE_SUDO='/opt/edamame-vuln-sudo/bin/sudo'
 CVE_SUDO_SHA='8c18093b760250d35b1ebcc5ecd12b33d17b8a2cfc27f170bbb4f62b674702cd'
@@ -32,6 +35,7 @@ Usage: edamame-ng.sh [--scan | --resume [RUN_ID]] [--output-dir DIR]
                       [--finish-bg-enum] [--verbose] [--no-shell]
                       [--enable-cve-2025-32463-lab]
        edamame-ng.sh --cve CVE-YYYY-NNNN [--catalog-dir DIR]
+       edamame-ng.sh --cve-details CVE-YYYY-NNNN [--catalog-dir DIR]
        edamame-ng.sh --poc CVE-YYYY-NNNN [--catalog-dir DIR]
 Run with no mode to choose Resume (default) or Scan when a prior success exists.
 --tool-dir accepts local assets only when each has an adjacent .sha256 file.
@@ -45,8 +49,9 @@ while (($#)); do
     --output-dir) (($# >= 2)) || { usage >&2; exit 2; }; RUN_BASE=$2; shift 2 ;;
     --tool-dir) (($# >= 2)) || { usage >&2; exit 2; }; TOOL_DIR=$2; shift 2 ;;
     --catalog-dir) (($# >= 2)) || { usage >&2; exit 2; }; CATALOG_DIR=$2; shift 2 ;;
-    --cve) (($# >= 2)) || { usage >&2; exit 2; }; CVE_QUERY=$2; shift 2 ;;
-    --poc) (($# >= 2)) || { usage >&2; exit 2; }; CVE_QUERY=$2; POC_QUERY=1; shift 2 ;;
+    --cve) (($# >= 2)) || { usage >&2; exit 2; }; CVE_QUERY=$2; QUERY_MODES=$((QUERY_MODES+1)); shift 2 ;;
+    --cve-details) (($# >= 2)) || { usage >&2; exit 2; }; CVE_QUERY=$2; CVE_DETAILS_QUERY=1; QUERY_MODES=$((QUERY_MODES+1)); shift 2 ;;
+    --poc) (($# >= 2)) || { usage >&2; exit 2; }; CVE_QUERY=$2; POC_QUERY=1; QUERY_MODES=$((QUERY_MODES+1)); shift 2 ;;
     --enable-cve-2025-32463-lab) LAB_CVE_ENABLED=1; shift ;;
     --no-shell) NO_SHELL=1; shift ;;
     --offline) OFFLINE=1; shift ;;
@@ -56,7 +61,13 @@ while (($#)); do
     *) usage >&2; exit 2 ;;
   esac
 done
+if ((QUERY_MODES > 1)); then
+  printf 'Choose one CVE query mode.\n' >&2
+  exit 2
+fi
 CVE_POC="$CATALOG_DIR/pocs/CVE-2025-32463/sudo-chwoot.sh"
+CVE_BASE="$CATALOG_DIR/local-eop.tsv"
+[[ -f $CVE_BASE ]] || CVE_BASE=/dev/null
 CVE_CURATED="$CATALOG_DIR/curated-eop.tsv"
 [[ -f $CVE_CURATED ]] || CVE_CURATED=/dev/null
 
@@ -65,7 +76,7 @@ cve_lookup() {
   row=$(awk -F '\t' -v id="$id" -v platform="$platform" 'FNR>1 && $1==id {
     status=($2==platform || platform=="any" ? "indexed-review-only" : "platform-mismatch")
     print $1 "\t" status "\t" $2 "\t" $3 "\t" $4 "\t" $5; exit}' \
-    "$CATALOG_DIR/local-eop.tsv" "$CVE_CURATED")
+    "$CVE_BASE" "$CVE_CURATED")
   if [[ -n $row ]]; then
     printf '%s\n' "$row"
     return
@@ -77,6 +88,24 @@ cve_lookup() {
   fi
   [[ -n $state ]] && state="${state}-general" || state=unindexed
   printf '%s\t%s\t\t\t\thttps://www.cve.org/CVERecord?id=%s\n' "$id" "$state" "$id"
+}
+
+cve_details_lookup() {
+  local id=$1 row state year review_state=not-in-local-details member
+  member=''
+  member=$(awk -F '\t' -v id="$id" 'FNR>1 && $1==id {print 1; exit}' "$CVE_BASE" "$CVE_CURATED")
+  if [[ -n $member ]] && verify_details_catalog; then
+    row=$(awk -F '\t' -v id="$id" 'FNR>1 && $1==id {print; exit}' "$CATALOG_DIR/local-eop-details.tsv")
+    if [[ -n $row ]]; then printf '%s\n' "$row"; return; fi
+  fi
+  if [[ $DETAILS_CATALOG_STATE == invalid ]]; then review_state=integrity-failed; fi
+  year=${id:4:4}
+  state=''
+  if [[ -f $CATALOG_DIR/cve-ids/$year.tsv ]]; then
+    state=$(awk -F '\t' -v id="$id" 'FNR>1 && $1==id {print $2; exit}' "$CATALOG_DIR/cve-ids/$year.tsv")
+  fi
+  [[ -n $state ]] || state=unindexed
+  printf '%s\t%s\t\t\t\t%s\n' "$id" "$state" "$review_state"
 }
 
 sha256_file() {
@@ -100,6 +129,23 @@ sha256_file() {
     fi
   done
   return 1
+}
+
+verify_details_catalog() {
+  local index=$CATALOG_DIR/local-eop-details.tsv manifest=$CATALOG_DIR/local-eop-details-source.json
+  local base=$CATALOG_DIR/cve-ids-source.json expected actual baseline index_baseline
+  [[ $DETAILS_CATALOG_STATE == valid ]] && return 0
+  [[ $DETAILS_CATALOG_STATE == invalid ]] && return 1
+  [[ -f $index ]] || { DETAILS_CATALOG_STATE=absent; return 1; }
+  DETAILS_CATALOG_STATE=invalid
+  [[ ! -L $index && -f $manifest && ! -L $manifest && -f $base && ! -L $base ]] || return 1
+  expected=$(sed -nE 's/^[[:space:]]*"details_sha256":[[:space:]]*"([0-9a-f]{64})",?[[:space:]]*$/\1/p' "$manifest")
+  baseline=$(sed -nE 's/^[[:space:]]*"baseline_sha256":[[:space:]]*"([0-9a-f]{64})",?[[:space:]]*$/\1/p' "$manifest")
+  index_baseline=$(sed -nE 's/^[[:space:]]*"baseline_sha256":[[:space:]]*"([0-9a-f]{64})",?[[:space:]]*$/\1/p' "$base")
+  [[ $expected =~ ^[0-9a-f]{64}$ && $baseline =~ ^[0-9a-f]{64}$ && $baseline == "$index_baseline" ]] || return 1
+  actual=$(sha256_file "$index") || return 1
+  [[ $actual == "$expected" ]] || return 1
+  DETAILS_CATALOG_STATE=valid
 }
 
 trusted_root_file() {
@@ -134,6 +180,13 @@ if [[ -n $CVE_QUERY ]]; then
       printf '%s\tverified-bundle\t%s\t%s\t%s\t%s\n' "$id" "$source" "$asset" "$digest" "$state"
     done < <(tail -n +2 "$CATALOG_DIR/poc_refs.tsv")
     ((poc_found)) || printf '%s\tnot-indexed\t\t\t\t\n' "$CVE_QUERY"
+  elif ((CVE_DETAILS_QUERY)); then
+    if [[ -f $CATALOG_DIR/local-eop-details.tsv ]] && ! verify_details_catalog; then
+      printf 'Offline CVE details failed integrity checks.\n' >&2
+      exit 2
+    fi
+    printf 'cve\tstate\tdescription\taffected_json\treferences_json\treview_state\n'
+    cve_details_lookup "$CVE_QUERY"
   else
     [[ -f $CATALOG_DIR/local-eop.tsv ]] || { printf 'Offline catalog unavailable.\n' >&2; exit 2; }
     printf 'cve\tstatus\tplatform\tproduct\tkev_date\treference\n'
@@ -531,19 +584,15 @@ Sudoers|enumerator output plus native sudo check
 Installed Applications|enumerator output
 Drive Configuration|enumerator output
 Service Enum|enumerator output
-Docker / LXC Enum|enumerator output plus Docker proof
+Docker / LXC Enum|enumerator output; Docker proof recorded separately
 Running Processes|enumerator output
 Network & WiFi Enumeration|local host output only
 Cronjobs & Scheduled Tasks|enumerator output; no task change
-Common Privilege Escalation Methods|enumerator output plus named recipes
-SUID / SGID binaries|enumerator output plus native bash and find proofs
+Common Privilege Escalation Methods|enumerator output; named recipes recorded separately
+SUID / SGID binaries|enumerator output; native bash and find proofs recorded separately
 Writable files & directories|enumerator output; no file change
 Passwords & sensitive files|enumerator output; values only in protected raw files
 Interesting Files|enumerator output
-Docker Escape|native Docker proof when prerequisites match
-Kernel & exploit checks|enumerator output; CVEs are suggestions only
-Environment abuse|enumerator output
-Path abuse|enumerator output
 Databases|passive enumeration only; no authentication
 MYSQL / MariaDB|passive enumeration only; no authentication
 POSTGRESQL|passive enumeration only; no authentication
@@ -552,6 +601,12 @@ Redis (redis-cli)|passive enumeration only; no authentication
 MongoDB|passive enumeration only; no authentication
 Automated Privilege Escalation Tools|LinPEAS and LSE
 EOF
+if [[ $selected == docker-host-root ]]; then
+  printf 'Docker Escape\tchecked\tread-only host bind probe returned UID 0\n' >> "$RUN_DIR/coverage.tsv"
+else
+  printf 'Docker Escape\tunsupported\tno independent Docker escape proof in this run\n' >> "$RUN_DIR/coverage.tsv"
+fi
+printf 'Kernel & exploit checks\tunsupported\tCVE text is a review lead, not build or patch proof\nEnvironment abuse\tunsupported\tno independent privilege proof\nPath abuse\tunsupported\tno independent privilege proof\n' >> "$RUN_DIR/coverage.tsv"
 # shellcheck disable=SC1112 # Preserve the checklist heading verbatim.
 printf 'Dump clear PSK keys from the Network Manager if available.\tunsupported\tno cleartext value extraction\nCheck for tasks that are run as root and are world writeable.\tunsupported\timpactful change needs a reviewed recipe\nRev Shell’s\tinapplicable\ttool opens a local shell\nRed Teaming Toolkit\tunsupported\ttool-specific checklist entry\nBeRoot\tunsupported\ttool-specific checklist entry\n' >> "$RUN_DIR/coverage.tsv"
 printf 'CVE build and patch applicability\tunsupported\toffline index is a review lead, not a vulnerable-build test\n' >> "$RUN_DIR/coverage.tsv"
@@ -575,6 +630,13 @@ else
   printf '[WARN] Offline CVE catalog unavailable; retaining CVE.org links.\n' >&2
   awk '{print $1 "\tunindexed\t\t\t\thttps://www.cve.org/CVERecord?id=" $1}' "$cve_tmp" >> "$RUN_DIR/cve-index.tsv"
 fi
+printf 'cve\tstate\tdescription\taffected_json\treferences_json\treview_state\n' > "$RUN_DIR/cve-details.tsv"
+if [[ -f $CATALOG_DIR/local-eop-details.tsv ]] && ! verify_details_catalog; then
+  printf '[WARN] Offline CVE details failed integrity checks; withholding details.\n' >&2
+fi
+while IFS= read -r cve; do
+  [[ -n $cve ]] && cve_details_lookup "$cve" >> "$RUN_DIR/cve-details.tsv"
+done < "$cve_tmp"
 printf '[SAVED] findings.tsv, coverage.tsv, attempts.tsv, tools.tsv\n'
 
 if [[ -n $selected ]]; then

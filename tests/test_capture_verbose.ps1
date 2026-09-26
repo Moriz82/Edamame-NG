@@ -13,10 +13,16 @@ foreach ($name in @('Write-CapturedTail', 'Invoke-CapturedProcess')) {
 
 if ($Worker) {
     $script:ShowRawOutput = $true
-    $child = 'cmd.exe'
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        $child = 'cmd.exe'
+        $arguments = '/d /c "echo started & ping -n 4 127.0.0.1 >nul & echo done"'
+    } else {
+        $child = '/bin/sh'
+        $arguments = '-c "printf started; sleep 3; printf done"'
+    }
     $output = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
     try {
-        $status = Invoke-CapturedProcess $child '/d /c "echo started & ping -n 4 127.0.0.1 >nul & echo done"' $output 10
+        $status = Invoke-CapturedProcess $child $arguments $output 10
         if ($status -ne 'checked') { throw "capture status: $status" }
         if ((Get-Content -LiteralPath $output -Raw) -notmatch 'started.*(?s:.)*done') { throw 'raw capture incomplete' }
         'worker-verified'
@@ -61,11 +67,12 @@ try {
     $process.WaitForExit()
     [void]$stdoutTask.Wait(5000)
     [void]$stderrTask.Wait(5000)
-    if ((Get-Content -LiteralPath $console -Raw) -notmatch 'worker-verified') {
+    $captured = [string](Get-Content -LiteralPath $console -Raw)
+    if ($process.ExitCode -ne 0 -or $captured -notmatch 'worker-verified') {
         throw "verbose worker failed: $(Get-Content -LiteralPath (Join-Path $testRoot 'console.err') -Raw)"
     }
     if (-not $live) { throw 'raw output was not visible while the enumerator ran' }
-    if ((Get-Content -LiteralPath $console -Raw) -notmatch 'started.*(?s:.)*done') { throw 'console output incomplete' }
+    if ($captured -notmatch 'started.*(?s:.)*done') { throw 'console output incomplete' }
     'Verbose captured output was visible before process completion and preserved in the raw file'
 } finally {
     if ($consoleStream) { $consoleStream.Dispose() }

@@ -18,6 +18,15 @@ $directGeneral = @(& $source -Cve 'CVE-2021-44228')
 if ($directGeneral.Count -lt 2 -or $directGeneral[1] -notmatch 'published-general') {
     throw 'General CVE lookup failed'
 }
+$directDetails = @(& $source -CveDetails 'CVE-2025-32463')
+if ($directDetails.Count -lt 2 -or $directDetails[1] -notmatch 'source-metadata-unreviewed' -or
+    $directDetails[1] -notmatch '"lessThan":"1\.9\.17p1"') {
+    throw 'Sparse CVE detail lookup failed'
+}
+$generalDetails = @(& $source -CveDetails 'CVE-2021-44228')
+if ($generalDetails.Count -lt 2 -or $generalDetails[1] -notmatch 'not-in-local-details') {
+    throw 'General CVE detail guard failed'
+}
 $directPoc = @(& $source -Poc 'CVE-2025-32463')
 if ($directPoc.Count -lt 2 -or $directPoc[1] -notmatch 'verified-bundle') {
     throw 'Direct PoC lookup failed'
@@ -37,6 +46,15 @@ try {
     Write-CveIndex $tampered @('CVE-2025-32463') $duplicateIndex
     $duplicateRow = @(Import-Csv -LiteralPath $duplicateIndex -Delimiter "`t")[0]
     if ($duplicateRow.platform -ne 'linux' -or $duplicateRow.product -ne 'Sudo') { throw 'Base catalog precedence failed' }
+    Remove-Item -LiteralPath (Join-Path $tampered 'local-eop-details.tsv')
+    $missingDetails = @(& $source -CveDetails 'CVE-2025-32463' -CatalogDir $tampered)
+    if ($missingDetails[1] -notmatch 'not-in-local-details') { throw 'Missing detail sidecar was inferred' }
+    Copy-Item -LiteralPath (Join-Path $root 'catalog/local-eop-details.tsv') -Destination (Join-Path $tampered 'local-eop-details.tsv')
+    Add-Content -LiteralPath (Join-Path $tampered 'local-eop-details.tsv') -Value 'tampered'
+    $detailRejected = $false
+    try { & $source -CveDetails 'CVE-2025-32463' -CatalogDir $tampered | Out-Null }
+    catch { $detailRejected = $true }
+    if (-not $detailRejected) { throw 'Tampered CVE details were accepted' }
     Set-Content -LiteralPath (Join-Path $tampered 'pocs/CVE-2025-32463/sudo-chwoot.sh') -Value 'tampered'
     $rejected = $false
     try { & $source -Poc 'CVE-2025-32463' -CatalogDir $tampered | Out-Null }

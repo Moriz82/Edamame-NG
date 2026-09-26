@@ -9,6 +9,7 @@ param(
     [string]$ToolDir,
     [string]$CatalogDir,
     [string]$Cve,
+    [string]$CveDetails,
     [string]$Poc,
     [switch]$Offline,
     [switch]$FinishBgEnum,
@@ -61,6 +62,46 @@ function Get-GeneralCveState([string]$CatalogPath, [string]$Id) {
     return (($match.Line -split "`t")[1] + '-general')
 }
 
+function Test-CveDetailsCatalog([string]$CatalogPath) {
+    $index = Join-Path $CatalogPath 'local-eop-details.tsv'
+    $manifest = Join-Path $CatalogPath 'local-eop-details-source.json'
+    $base = Join-Path $CatalogPath 'cve-ids-source.json'
+    if (-not (Test-Path -LiteralPath $index -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $manifest -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $base -PathType Leaf)) { return $false }
+    try {
+        foreach ($path in @($index, $manifest, $base)) {
+            if ((Get-Item -LiteralPath $path).Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+        }
+        $source = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+        $indexSource = Get-Content -LiteralPath $base -Raw | ConvertFrom-Json
+        if ($source.details_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            $source.baseline_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            $source.baseline_sha256 -cne $indexSource.baseline_sha256) { return $false }
+        return (Get-FileHash -LiteralPath $index -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $source.details_sha256
+    } catch { return $false }
+}
+
+function Get-CveDetailsLine([string]$CatalogPath, [string]$Id) {
+    $index = Join-Path $CatalogPath 'local-eop-details.tsv'
+    $reviewState = 'not-in-local-details'
+    if (Test-Path -LiteralPath $index -PathType Leaf) {
+        if (Test-CveDetailsCatalog $CatalogPath) {
+            $member = @(Get-CatalogEntries $CatalogPath | Where-Object cve -eq $Id | Select-Object -First 1)
+            if ($member.Count) {
+                foreach ($line in [IO.File]::ReadAllLines($index, [Text.Encoding]::UTF8)) {
+                    if ($line.StartsWith("$Id`t", [StringComparison]::Ordinal)) { return $line }
+                }
+            }
+        } else { $reviewState = 'integrity-failed' }
+    }
+    $state = Get-GeneralCveState $CatalogPath $Id
+    if ($state.EndsWith('-general', [StringComparison]::Ordinal)) {
+        $state = $state.Substring(0, $state.Length - 8)
+    }
+    return "$Id`t$state`t`t`t`t$reviewState"
+}
+
 function Write-CveIndex([string]$CatalogPath, [string[]]$Suggested, [string]$Destination) {
     $catalog = @{}
     $indexPath = Join-Path $CatalogPath 'local-eop.tsv'
@@ -86,7 +127,7 @@ function Write-CveIndex([string]$CatalogPath, [string[]]$Suggested, [string]$Des
 }
 
 if ($Poc) {
-    if ($Cve) { throw 'Choose one of -Cve or -Poc.' }
+    if ($Cve -or $CveDetails) { throw 'Choose one CVE query mode.' }
     if ($Poc -cnotmatch '^CVE-[0-9]{4}-[0-9]{4,}$') { throw 'Invalid CVE ID.' }
     $manifest = Join-Path $CatalogDir 'poc_refs.tsv'
     if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { throw 'Offline PoC manifest unavailable.' }
@@ -109,6 +150,16 @@ if ($Poc) {
         }
         "$Poc`tverified-bundle`t$($item.source_url)`t$asset`t$($item.sha256)`t$($item.review_state)"
     }
+    return
+}
+
+if ($CveDetails) {
+    if ($Cve) { throw 'Choose one CVE query mode.' }
+    if ($CveDetails -cnotmatch '^CVE-[0-9]{4}-[0-9]{4,}$') { throw 'Invalid CVE ID.' }
+    if ((Test-Path -LiteralPath (Join-Path $CatalogDir 'local-eop-details.tsv') -PathType Leaf) -and
+        -not (Test-CveDetailsCatalog $CatalogDir)) { throw 'Offline CVE details failed integrity checks.' }
+    "cve`tstate`tdescription`taffected_json`treferences_json`treview_state"
+    Get-CveDetailsLine $CatalogDir $CveDetails
     return
 }
 
@@ -1163,21 +1214,27 @@ if (Test-SystemIdentity) {
     Write-Finding 'local-elevation' 'Standard-user SYSTEM route verified on the exact disposable weak-service fixture'
 }
 $enumStatus = if ($winpeasOk -and $privescComplete) { 'checked' } else { 'unsupported' }
+Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "External local enumerator capture`t$enumStatus`tWinPEAS and PrivescCheck completion only"
 foreach ($area in @(
     'Situational Awareness and Initial Enumeration', 'WiFi & Network Enumeration',
     'Processes & Tasks', 'BIOS & Hardware Information', 'Sensitive Information & Passwords',
-    'Registry Queries', 'Installed Software', 'Logging/AV enumeration',
+    'Registry Queries', 'Installed Software', 'Logging/AV enumeration')) {
+    Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "$area`t$enumStatus`texternal enumerator output only; individual conditions unverified"
+}
+foreach ($area in @(
     'Common Privilege Escalation Methods', 'LOW HANGING FRUIT:',
     'UNQUOTED SERVICE PATHS', 'WEAK SERVICE PERMISSIONS:', 'SCHEDULED TASKS:',
     'IMPERSONATION (SeImpersonatePrivilege or SeAssignPrimaryPrivilege):')) {
-    Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "$area`t$enumStatus`tenumerator output; only named recipes are attempted"
+    Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "$area`tunsupported`tno independent privilege proof for the full checklist area"
 }
 Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "UAC BYPASS:`tunsupported`tUAC admin consent is the only current recipe"
 $domainStatus = if (-not $domainJoined) { 'inapplicable' }
     elseif ($sharpCollectedZip -and $sharpStatus -eq 'checked') { 'checked' }
     else { 'unsupported' }
-foreach ($area in @('Active Directory', 'Initial Enumeration', 'BloodHound')) {
-    Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "$area`t$domainStatus`tSharpHound Default collection"
+Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "BloodHound`t$domainStatus`tSharpHound Default collection ZIP"
+foreach ($area in @('Active Directory', 'Initial Enumeration')) {
+    $status = if ($domainJoined) { 'unsupported' } else { 'inapplicable' }
+    Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "$area`t$status`tSharpHound Default does not verify the full checklist area"
 }
 foreach ($area in @(
     'Enumerating DACLs with BloodyAD', 'Credential Hunting', 'POISONING Attacks',
@@ -1204,6 +1261,11 @@ if ($sharpCollectedZip -and (Test-Path -LiteralPath $sharpCollectedZip.FullName)
 $suggestedCves | ForEach-Object { "$_`thttps://www.cve.org/CVERecord?id=$_" } |
     Set-Content -LiteralPath (Join-Path $runDir 'cve-candidates.tsv') -Encoding ASCII
 Write-CveIndex $CatalogDir $suggestedCves (Join-Path $runDir 'cve-index.tsv')
+$detailLines = @("cve`tstate`tdescription`taffected_json`treferences_json`treview_state")
+if ((Test-Path -LiteralPath (Join-Path $CatalogDir 'local-eop-details.tsv') -PathType Leaf) -and
+    -not (Test-CveDetailsCatalog $CatalogDir)) { Write-Warning 'Offline CVE details failed integrity checks; withholding details.' }
+foreach ($id in $suggestedCves) { $detailLines += Get-CveDetailsLine $CatalogDir $id }
+$detailLines | Set-Content -LiteralPath (Join-Path $runDir 'cve-details.tsv') -Encoding UTF8
 Write-Host '[SAVED] findings.tsv, coverage.tsv, attempts.tsv, tools.tsv'
 
 if ($fastSuccessRecipe) {

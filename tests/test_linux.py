@@ -98,9 +98,18 @@ else:
     assert "CVE-2026-12345\tunindexed" in index
     assert "CVE-2025-32463\tindexed-review-only\tlinux" in index
     assert "CVE-2023-4911\tindexed-review-only\tlinux\tglibc" in index
+    details = (run_dir / "cve-details.tsv").read_text()
+    assert "CVE-2025-32463\tpublished\t" in details
+    assert '"lessThan":"1.9.17p1"' in details
+    assert "CVE-2026-12345\tunindexed\t\t\t\tnot-in-local-details" in details
     assert "sudo-shell" in (run_dir / "success.tsv").read_text()
     assert "CVE-2025-32463 tested lab build\tunsupported\texplicit lab opt-in not supplied" in (
         run_dir / "coverage.tsv").read_text()
+    coverage = (run_dir / "coverage.tsv").read_text()
+    assert "Docker Escape\tunsupported\tno independent Docker escape proof" in coverage
+    assert "Kernel & exploit checks\tunsupported\tCVE text is a review lead" in coverage
+    assert "Environment abuse\tunsupported\tno independent privilege proof" in coverage
+    assert "Path abuse\tunsupported\tno independent privilege proof" in coverage
     assert "cve-2025-32463-lab" not in (run_dir / "attempts.tsv").read_text()
     assert len(marker.read_text().splitlines()) == 4
     resumed = run(ROOT / "edamame-ng.sh", env, "--resume", "--no-shell",

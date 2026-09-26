@@ -58,24 +58,50 @@ with tempfile.TemporaryDirectory(prefix="edamame-catalog-") as root:
     inner_bytes = io.BytesIO()
     with zipfile.ZipFile(inner_bytes, 'w', zipfile.ZIP_DEFLATED) as inner:
         for cve, state in (("CVE-2021-44228", "PUBLISHED"),
-                           ("CVE-2026-99999", "REJECTED")):
+                           ("CVE-2026-99999", "REJECTED"),
+                           ("CVE-2025-32463", "PUBLISHED")):
+            record = {"cveMetadata": {"cveId": cve, "state": state}}
+            if cve == "CVE-2025-32463":
+                record["containers"] = {"cna": {
+                    "descriptions": [{"lang": "en", "value": "  Local\nreview  lead.  "}],
+                    "affected": [{"vendor": "Sudo project", "product": "Sudo",
+                                  "versions": [{"version": "1.9.14", "lessThan": "1.9.17p1",
+                                                "status": "affected"}]}],
+                    "references": [{"url": "https://www.sudo.ws/security/advisories/"}],
+                }}
             inner.writestr(f"cves/{cve[4:8]}/{cve}.json",
-                           json.dumps({"cveMetadata": {"cveId": cve, "state": state}}))
+                           json.dumps(record))
     baseline = work / '2026-09-25_all_CVEs_at_midnight.zip.zip'
     with zipfile.ZipFile(baseline, 'w', zipfile.ZIP_STORED) as outer:
         outer.writestr('cves.zip', inner_bytes.getvalue())
     all_output = work / 'all-cves'
+    all_output.mkdir()
+    (all_output / 'local-eop.tsv').write_text(
+        'cve\tplatform\tproduct\tkev_date\treference\n'
+        'CVE-2025-32463\tlinux\tSudo\t\thttps://www.cve.org/CVERecord?id=CVE-2025-32463\n')
+    (all_output / 'curated-eop.tsv').write_text('cve\tplatform\tproduct\tkev_date\treference\n')
     all_command = ["python3", "scripts/build_cve_ids.py", "--input", str(baseline),
                    "--output", str(all_output), "--expected-sha256",
-                   hashlib.sha256(baseline.read_bytes()).hexdigest()]
+                   hashlib.sha256(baseline.read_bytes()).hexdigest(), '--with-local-details']
     run(all_command)
     first_ids = (all_output / 'cve-ids/2021.tsv').read_bytes()
+    first_details = (all_output / 'local-eop-details.tsv').read_bytes()
     run(all_command)
     assert first_ids == (all_output / 'cve-ids/2021.tsv').read_bytes()
+    assert first_details == (all_output / 'local-eop-details.tsv').read_bytes()
     assert 'CVE-2026-99999\trejected' in (all_output / 'cve-ids/2026.tsv').read_text()
-    assert json.loads((all_output / 'cve-ids-source.json').read_text())['record_count'] == 2
+    assert json.loads((all_output / 'cve-ids-source.json').read_text())['record_count'] == 3
     assert json.loads((all_output / 'cve-ids-source.json').read_text())['published_digest_verified']
-    assert run(all_command[:-1] + ['0' * 64], check=False).returncode != 0
+    assert json.loads((all_output / 'cve-ids-source.json').read_text())['state_counts'] == {
+        'published': 2, 'rejected': 1, 'reserved': 0}
+    assert b'Local review lead.' in first_details and b'"lessThan":"1.9.17p1"' in first_details
+    assert json.loads((all_output / 'local-eop-details-source.json').read_text())['selected_count'] == 1
+    assert run(all_command[:all_command.index('--expected-sha256')] + [
+        '--expected-sha256', '0' * 64, '--with-local-details'], check=False).returncode != 0
+    (all_output / 'curated-eop.tsv').write_text(
+        'cve\tplatform\tproduct\tkev_date\treference\nCVE-2099-99999\tlinux\tMissing\t\thttps://example.invalid\n')
+    assert run(all_command, check=False).returncode != 0
+    (all_output / 'curated-eop.tsv').write_text('cve\tplatform\tproduct\tkev_date\treference\n')
 
     fake = work / "bin"
     fake.mkdir()
@@ -101,6 +127,13 @@ with tempfile.TemporaryDirectory(prefix="edamame-catalog-") as root:
             ["bash", "edamame-ng.sh", "--cve", identifier], env).stdout
     assert "unindexed" in run(["bash", "edamame-ng.sh", "--cve", "CVE-2099-99999"], env).stdout
     assert "published-general" in run(["bash", "edamame-ng.sh", "--cve", "CVE-2021-44228"], env).stdout
+    details = run(["bash", "edamame-ng.sh", "--cve-details", "CVE-2025-32463"], env).stdout
+    assert 'source-metadata-unreviewed' in details and '"lessThan":"1.9.17p1"' in details
+    assert 'not-in-local-details' in run(["bash", "edamame-ng.sh", "--cve-details", "CVE-2021-44228"], env).stdout
+    assert run(["bash", "edamame-ng.sh", "--cve", "CVE-2025-32463",
+                "--cve-details", "CVE-2021-44228"], env, False).returncode == 2
+    assert run(["bash", "edamame-ng.sh", "--cve-details", "CVE-2025-32463",
+                "--poc", "CVE-2021-4034"], env, False).returncode == 2
     bundled = run(["bash", "edamame-ng.sh", "--poc", "CVE-2025-32463"], env).stdout
     assert "verified-bundle" in bundled and "exact-build-only" in bundled
     assert "reference-only" in run(["bash", "edamame-ng.sh", "--poc", "CVE-2021-4034"], env).stdout
@@ -113,6 +146,11 @@ with tempfile.TemporaryDirectory(prefix="edamame-catalog-") as root:
         windows = run([str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
                        "-Cve", "CVE-2021-36934"], env).stdout
         assert "indexed-review-only\twindows" in windows
+        windows_details = run([str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
+                               "-CveDetails", "CVE-2025-32463"], env).stdout
+        assert 'source-metadata-unreviewed' in windows_details and '"lessThan":"1.9.17p1"' in windows_details
+        assert 'not-in-local-details' in run([str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
+                                               "-CveDetails", "CVE-2021-44228"], env).stdout
         assert "indexed-review-only\tlinux\tglibc" in run(
             [str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
              "-Cve", "CVE-2023-4911"], env).stdout
@@ -142,6 +180,35 @@ with tempfile.TemporaryDirectory(prefix="edamame-catalog-") as root:
         assert "indexed-review-only\tlinux\tSudo" in run(
             [str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
              "-Cve", "CVE-2025-32463", "-CatalogDir", str(copied)], env).stdout
+    detail_file = copied / 'local-eop-details.tsv'
+    detail_file.write_bytes(detail_file.read_bytes() + b'\n')
+    assert run(["bash", "edamame-ng.sh", "--cve-details", "CVE-2025-32463",
+                "--catalog-dir", str(copied)], env, False).returncode == 2
+    if PWSH.is_file():
+        assert run([str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
+                    "-CveDetails", "CVE-2025-32463", "-CatalogDir", str(copied)], env, False).returncode != 0
+    member_catalog = work / 'removed-candidate'
+    shutil.copytree(ROOT / 'catalog', member_catalog)
+    base_rows = (member_catalog / 'local-eop.tsv').read_text().splitlines()
+    (member_catalog / 'local-eop.tsv').write_text(
+        '\n'.join(row for row in base_rows if not row.startswith('CVE-2025-32463\t')) + '\n')
+    assert 'not-in-local-details' in run(
+        ["bash", "edamame-ng.sh", "--cve-details", "CVE-2025-32463",
+         "--catalog-dir", str(member_catalog)], env).stdout
+    if PWSH.is_file():
+        assert 'not-in-local-details' in run(
+            [str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
+             "-CveDetails", "CVE-2025-32463", "-CatalogDir", str(member_catalog)], env).stdout
+    curated_only = work / 'curated-only'
+    shutil.copytree(ROOT / 'catalog', curated_only)
+    (curated_only / 'local-eop.tsv').unlink()
+    assert 'source-metadata-unreviewed' in run(
+        ["bash", "edamame-ng.sh", "--cve-details", "CVE-2023-4911",
+         "--catalog-dir", str(curated_only)], env).stdout
+    if PWSH.is_file():
+        assert 'source-metadata-unreviewed' in run(
+            [str(PWSH), "-NoProfile", "-File", "Edamame-NG.ps1",
+             "-CveDetails", "CVE-2023-4911", "-CatalogDir", str(curated_only)], env).stdout
     (copied / "curated-eop.tsv").unlink()
     assert "published-general" in run(["bash", "edamame-ng.sh", "--cve", "CVE-2023-4911",
                                "--catalog-dir", str(copied)], env).stdout
