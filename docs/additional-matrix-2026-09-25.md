@@ -1,5 +1,7 @@
 # Additional isolated guest matrix — 2026-09-25
 
+The `31 checked areas` below are the tested revision's collector-completion labels. They do not mean that each checklist condition or escalation path was independently verified; current coverage output separates those unsupported areas.
+
 Three unprivileged Linux containers ran on the disposable `lab-net-05` bridge on `lab-hypervisor`. The bridge used an isolated private subnet and had no uplink or default route. The containers had only bridge-local addresses. No production VM, source VM, or current assessment target was used. Raw enumerator output and credentials are excluded from this record.
 
 The [Proxmox template mirror](https://download.proxmox.com/images/system/) supplied the templates; Proxmox reported a verified checksum on download. Calculated SHA-256 values of the downloaded archives were:

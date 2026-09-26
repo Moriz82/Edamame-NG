@@ -1,5 +1,7 @@
 # SUID `find` acceptance — 2026-09-25
 
+The `31 checked` count below is a historical collector-completion label. It does not establish independent proof for every checklist area; current coverage output separates unsupported conditions.
+
 Disposable Debian 13.1 unprivileged CT 1710 (`edamame-find`) ran on `lab-hypervisor` with an isolated, uplink-free `lab-net-06` bridge. It used the existing Proxmox Debian 13 template, whose calculated SHA-256 was `ca6dffb91c3239fedc30af2c11389198140de1f1fc3d58082f3d9f4239b92e1b`. The staged Linux runner SHA-256 was `76df5e25a12be76c975f34d9706d3474bb25cf0d5c2d9a23a08b96ef6355e6b3`. The local LinPEAS and LSE assets had adjacent SHA-256 files. No production VM or current assessment target was used.
 
 | State | Run or action | Observed result |

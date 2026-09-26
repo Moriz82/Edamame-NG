@@ -1,5 +1,7 @@
 # Windows Server 2025 acceptance — 2026-09-25
 
+Coverage labels below describe the tested revision. The current runner treats a completed SharpHound ZIP as BloodHound collection only; it marks the broader Active Directory area unsupported pending independent checks. The historical `Active Directory checked` row is not a current coverage claim.
+
 Disposable VM 1802 on an isolated Proxmox host ran Windows Server 2025 Datacenter Evaluation, build 26100, with Windows PowerShell 5.1.26100.7462. The ISO came from [Microsoft's Evaluation Center](https://www.microsoft.com/en-us/evalcenter/download-windows-server-2025) through its official download alias. Its locally calculated SHA-256 was `7b052573ba7894c9924e3e87ba732ccd354d18cb75a883efa9b900ea125bfd51`; no independent published digest for this exact evaluation ISO was verified. The VM used an isolated `lab-net-10` bridge with no uplink and a temporary address. No assessment target or production guest was tested. Credentials and raw enumerator output are excluded from this record.
 
 The transferred tool bundle matched SHA-256 `c78832f917a63449d14ac876f11066c6dfee41ca26149e361157f445d290ab4c`. Native PowerShell 5.1 runs of `tests/test_windows_catalog.ps1` and `tests/test_release.ps1` passed.
