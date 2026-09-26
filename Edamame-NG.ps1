@@ -28,8 +28,7 @@ if ([string]::IsNullOrWhiteSpace($localBase)) {
     $localBase = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
 }
 if ([string]::IsNullOrWhiteSpace($localBase)) {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    $localBase = Join-Path ([IO.Path]::GetTempPath()) ("Edamame-NG-$identity")
+    throw 'Cannot determine the local application data path for private run and cache storage.'
 }
 if ([string]::IsNullOrWhiteSpace($OutputDir)) { $OutputDir = Join-Path $localBase 'Edamame-NG\runs' }
 $cacheBase = Join-Path $localBase 'Edamame-NG\cache'
