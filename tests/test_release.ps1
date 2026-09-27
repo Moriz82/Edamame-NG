@@ -53,7 +53,47 @@ try {
     Remove-Item -LiteralPath $dest
     if (-not (Get-ReleaseAsset 'example/repo' 'fixture.ps1' $dest)) { throw 'verified cache fallback failed' }
     if ((Get-Content -LiteralPath (Join-Path $runDir 'tools.tsv') -Raw) -notmatch 'fixture.ps1\tcache') { throw 'cache provenance missing' }
-    'PowerShell parse, digest rejection, release digest, and cache fallback passed'
+    $script:corruptSource = Join-Path (Join-Path $cacheBase 'example_repo') 'fixture.ps1'
+    function Copy-Item {
+        [CmdletBinding()]
+        param([string]$LiteralPath, [string]$Destination, [switch]$Force)
+        Microsoft.PowerShell.Management\Copy-Item -LiteralPath $LiteralPath -Destination $Destination -Force -ErrorAction Stop
+        if ($LiteralPath -eq $script:corruptSource) { Add-Content -LiteralPath $Destination -Value 'tampered' }
+    }
+    Remove-Item -LiteralPath $dest
+    if (Get-ReleaseAsset 'example/repo' 'fixture.ps1' $dest) { throw 'changed cache copy was accepted' }
+    if (Test-Path -LiteralPath $dest) { throw 'changed cache copy was retained' }
+    Remove-Item Function:Copy-Item
+    $ToolDir = Join-Path $testRoot 'tools'
+    $corrupt = Join-Path $ToolDir 'corrupt.ps1'
+    Set-Content -LiteralPath $corrupt -Value 'synthetic content' -Encoding ASCII
+    Set-Content -LiteralPath "$corrupt.sha256" -Value (Get-FileHash -LiteralPath $corrupt -Algorithm SHA256).Hash
+    $script:corruptSource = $corrupt
+    function Copy-Item {
+        [CmdletBinding()]
+        param([string]$LiteralPath, [string]$Destination, [switch]$Force)
+        Microsoft.PowerShell.Management\Copy-Item -LiteralPath $LiteralPath -Destination $Destination -Force -ErrorAction Stop
+        if ($LiteralPath -eq $script:corruptSource) { Add-Content -LiteralPath $Destination -Value 'tampered' }
+    }
+    $corruptDest = Join-Path $runDir 'corrupt.ps1'
+    if (Get-ReleaseAsset 'example/repo' 'corrupt.ps1' $corruptDest) { throw 'changed copy was accepted' }
+    if (Test-Path -LiteralPath $corruptDest) { throw 'changed copy was retained' }
+    Remove-Item Function:Copy-Item
+    $blocked = Join-Path $ToolDir 'blocked.exe'
+    Set-Content -LiteralPath $blocked -Value 'synthetic blocked content' -Encoding ASCII
+    $blockedHash = (Get-FileHash -LiteralPath $blocked -Algorithm SHA256).Hash
+    Set-Content -LiteralPath "$blocked.sha256" -Value $blockedHash
+    function Get-FileHash {
+        param([string]$LiteralPath, [string]$Algorithm)
+        throw (New-Object System.IO.IOException -ArgumentList 'synthetic asset read block')
+    }
+    if (Get-ReleaseAsset 'example/repo' 'blocked.exe' (Join-Path $runDir 'blocked.exe')) {
+        throw 'unreadable local asset accepted'
+    }
+    if ((Get-Content -LiteralPath (Join-Path $runDir 'tools.tsv') -Raw) -notmatch 'blocked.exe\tmissing') {
+        throw 'unreadable asset was not recorded as missing'
+    }
+    'PowerShell parse, digest rejection, release digest, cache fallback, changed-copy rejection, and unreadable asset handling passed'
 } finally {
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

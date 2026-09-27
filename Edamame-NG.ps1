@@ -1252,19 +1252,53 @@ function Invoke-CapturedProcess([string]$FilePath, [string]$Arguments, [string]$
         elseif ($exitCode -ne 0) { 'partial' }
         else { 'checked' }
     $pending = "$OutputPath.pending"
+    $sharedCapture = $false
+    $shortSharedCapture = $false
     try {
         $destination = [IO.File]::Create($pending)
         try {
             foreach ($part in @($stdout, $stderr)) {
                 if (Test-Path -LiteralPath $part) {
-                    $source = [IO.File]::OpenRead($part)
-                    try { $source.CopyTo($destination) } finally { $source.Dispose() }
+                    $source = $null
+                    $sharedPart = $false
+                    for ($retry = 0; $retry -lt 20; $retry++) {
+                        try {
+                            $source = [IO.File]::OpenRead($part)
+                            break
+                        } catch [IO.IOException] {
+                            if ($retry -lt 19) { Start-Sleep -Milliseconds 250 }
+                        }
+                    }
+                    if (-not $source) {
+                        # A process outside the Job Object can independently hold
+                        # a writer handle. Preserve a bounded snapshot.
+                        $source = [IO.File]::Open($part, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+                            ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+                        $sharedPart = $true
+                    }
+                    try {
+                        if ($sharedPart) {
+                            $remaining = $source.Length
+                            $buffer = New-Object byte[] 81920
+                            while ($remaining -gt 0) {
+                                $count = $source.Read($buffer, 0, [int][Math]::Min($remaining, $buffer.Length))
+                                if ($count -le 0) { break }
+                                $destination.Write($buffer, 0, $count)
+                                $remaining -= $count
+                            }
+                            if ($remaining -gt 0) { $shortSharedCapture = $true }
+                        } else { $source.CopyTo($destination) }
+                    } finally { $source.Dispose() }
+                    if ($sharedPart) { $sharedCapture = $true }
                 }
             }
         } finally { $destination.Dispose() }
+        if ($sharedCapture -and $status -eq 'checked') { $status = 'partial' }
         [IO.File]::Move($pending, $OutputPath)
         Publish-EnumTerminal $terminalPath $status $exitCode $LaunchId
-        Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
+        if (-not $sharedCapture) {
+            Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
+        }
     } catch {
         Remove-Item -LiteralPath $pending, $OutputPath -Force -ErrorAction SilentlyContinue
         try { Publish-EnumTerminal $terminalPath 'cleanup-failed' -1 $LaunchId } catch { }
@@ -1273,6 +1307,12 @@ function Invoke-CapturedProcess([string]$FilePath, [string]$Arguments, [string]$
     }
     if ($timedOut) {
         Write-Warning "$([IO.Path]::GetFileName($FilePath)) exceeded $TimeoutSeconds seconds; preserving partial output."
+    }
+    if ($sharedCapture) {
+        Write-Warning "$([IO.Path]::GetFileName($FilePath)) kept a bounded shared capture snapshot; raw parts remain for review."
+    }
+    if ($shortSharedCapture) {
+        Write-Warning "$([IO.Path]::GetFileName($FilePath)) shared capture changed before the snapshot finished."
     }
     return $status
 }
@@ -1299,7 +1339,7 @@ function Start-EnumJob([string]$Name, [string]$FilePath, [string]$Arguments, [st
         Terminal = "$OutputPath.terminal.json"
         LaunchId = $launchId
         Deadline = [DateTime]::UtcNow.AddSeconds($ToolTimeoutSeconds)
-        GraceSeconds = 5
+        GraceSeconds = 60
         Offset = [long]0
         Stopped = $false
         Status = $null
@@ -1320,11 +1360,14 @@ function Stop-EnumJob($Entry) {
 function Complete-EnumJob($Entry) {
     $limit = $Entry.Deadline.AddSeconds([int]$Entry.GraceSeconds)
     while (-not (Read-EnumTerminal $Entry) -and [DateTime]::UtcNow -lt $limit) {
+        if ($Entry.Job.State -in @('Completed', 'Failed', 'Stopped')) { break }
         Start-Sleep -Milliseconds 100
     }
     if (-not (Read-EnumTerminal $Entry)) {
         Stop-EnumJob $Entry
-        while (-not (Read-EnumTerminal $Entry) -and [DateTime]::UtcNow -lt $limit) {
+        $cancelLimit = [DateTime]::UtcNow.AddSeconds([int]$Entry.GraceSeconds)
+        while (-not (Read-EnumTerminal $Entry) -and [DateTime]::UtcNow -lt $cancelLimit) {
+            if ($Entry.Job.State -in @('Completed', 'Failed', 'Stopped')) { break }
             Start-Sleep -Milliseconds 100
         }
     }
@@ -1427,16 +1470,28 @@ function Get-ReleaseAsset([string]$Repo, [string]$Asset, [string]$Destination) {
     if ($ToolDir) {
         $local = Join-Path $ToolDir $Asset
         $digestFile = "$local.sha256"
-        if ((Test-Path -LiteralPath $local) -and (Test-Path -LiteralPath $digestFile)) {
-            $expected = ((Get-Content -LiteralPath $digestFile -TotalCount 1) -split '\s+')[0]
-            if ($expected -match '^[a-fA-F0-9]{64}$' -and
-                (Get-FileHash -LiteralPath $local -Algorithm SHA256).Hash -eq $expected) {
-                Copy-Item -LiteralPath $local -Destination $Destination
-                Add-Content -LiteralPath (Join-Path $runDir 'tools.tsv') -Value "$Asset`tlocal`t$local`t$expected"
-                return $true
+        $localReady = $false
+        try {
+            if ((Test-Path -LiteralPath $local) -and (Test-Path -LiteralPath $digestFile)) {
+                $expected = ((Get-Content -LiteralPath $digestFile -TotalCount 1) -split '\s+')[0]
+                if ($expected -match '^[a-fA-F0-9]{64}$' -and
+                    (Get-FileHash -LiteralPath $local -Algorithm SHA256).Hash -eq $expected) {
+                    Copy-Item -LiteralPath $local -Destination $Destination -ErrorAction Stop
+                    if ((Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash -ne $expected) {
+                        throw 'Copied asset digest mismatch.'
+                    }
+                    $localReady = $true
+                }
             }
+        } catch {
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+            Write-Warning "Local $Asset could not be read or copied: $($_.Exception.Message)"
         }
-        Write-Warning "Local $Asset missing or checksum failed."
+        if ($localReady) {
+            Add-Content -LiteralPath (Join-Path $runDir 'tools.tsv') -Value "$Asset`tlocal`t$local`t$expected"
+            return $true
+        }
+        if (-not $localReady) { Write-Warning "Local $Asset unavailable or checksum failed." }
     } elseif (-not $Offline) {
         try {
             $latest = Invoke-WebRequest -Uri "https://github.com/$Repo/releases/latest" -UseBasicParsing -MaximumRedirection 10 -TimeoutSec 20
@@ -1466,14 +1521,26 @@ function Get-ReleaseAsset([string]$Repo, [string]$Asset, [string]$Destination) {
         Write-Host "[OFFLINE] Checking verified cache for $Asset."
     }
 
-    if ((Test-Path -LiteralPath $cached) -and (Test-Path -LiteralPath "$cached.sha256")) {
-        $expected = (Get-Content -LiteralPath "$cached.sha256" -TotalCount 1).Trim()
-        if ($expected -match '^[a-fA-F0-9]{64}$' -and
-            (Get-FileHash -LiteralPath $cached -Algorithm SHA256).Hash -eq $expected) {
-            Copy-Item -LiteralPath $cached -Destination $Destination -Force
-            Add-Content -LiteralPath (Join-Path $runDir 'tools.tsv') -Value "$Asset`tcache`t$cached`t$expected"
-            return $true
+    $cacheReady = $false
+    try {
+        if ((Test-Path -LiteralPath $cached) -and (Test-Path -LiteralPath "$cached.sha256")) {
+            $expected = (Get-Content -LiteralPath "$cached.sha256" -TotalCount 1).Trim()
+            if ($expected -match '^[a-fA-F0-9]{64}$' -and
+                (Get-FileHash -LiteralPath $cached -Algorithm SHA256).Hash -eq $expected) {
+                Copy-Item -LiteralPath $cached -Destination $Destination -Force -ErrorAction Stop
+                if ((Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash -ne $expected) {
+                    throw 'Copied asset digest mismatch.'
+                }
+                $cacheReady = $true
+            }
         }
+    } catch {
+        Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        Write-Warning "Cached $Asset could not be read or copied: $($_.Exception.Message)"
+    }
+    if ($cacheReady) {
+        Add-Content -LiteralPath (Join-Path $runDir 'tools.tsv') -Value "$Asset`tcache`t$cached`t$expected"
+        return $true
     }
     Add-Content -LiteralPath (Join-Path $runDir 'tools.tsv') -Value "$Asset`tmissing`t-`t-"
     return $false
@@ -1594,10 +1661,10 @@ function Test-TrustedSystemBinary([string]$Path) {
         $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName -ErrorAction Stop
         if ($signature.Status -eq 'Valid' -and $signature.SignerCertificate -and
             $signature.SignerCertificate.Subject -match '^CN=Microsoft (Windows|Corporation),') { return $true }
-        # Windows PowerShell 3 on Server 2012 can report catalog-signed OS
-        # files as NotSigned. Accept only the exact WRP-protected system files.
-        $version = [Environment]::OSVersion.Version
-        if ($signature.Status -ne 'NotSigned' -or $version.Major -ne 6 -or $version.Minor -ne 2) { return $false }
+        # A standard-user token can report catalog-signed OS files as NotSigned
+        # on newer Windows too. Require WRP protection, TrustedInstaller ownership,
+        # and a failed write-open before accepting that result.
+        if ($signature.Status -ne 'NotSigned') { return $false }
         if (-not ('EdamameSystemFileTrust' -as [type])) {
             Add-Type -TypeDefinition @'
 using System;
@@ -2020,8 +2087,12 @@ elseif ($EnableWeakServiceLab -and (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Edama
     $weakLabState = Get-WeakServiceLabState
     if ($weakLabState) { $fastRecipe = 'weak-service-lab' }
 }
-if ($fastRecipe -eq 'weak-service-lab' -and $enumJobs.Count -gt 0) {
-    Write-Host '[RECIPE] Waiting for collectors before the named-pipe service proof.'
+$deferredWeakService = $false
+if ($fastRecipe -eq 'weak-service-lab' -and $winpeasJob) {
+    # WinPEAS reads ACLs on named pipes. An early read can consume and close
+    # our pipe before the SYSTEM client connects. Other collectors may continue.
+    Write-Host '[RECIPE] Waiting for WinPEAS before the named-pipe service proof.'
+    $deferredWeakService = $true
     $fastRecipe = $null
 }
 if ($fastRecipe) {
@@ -2070,6 +2141,32 @@ while (@($enumJobs | Where-Object { $_.Job.State -in @('NotStarted', 'Running') 
     if ($liveCves.Count -gt $lastLiveCount) {
         Write-Finding 'cve-candidates' "$($liveCves.Count) suggested so far; review exact build and patch status"
         $lastLiveCount = $liveCves.Count
+    }
+    if ($deferredWeakService -and $winpeasJob) {
+        $winpeasTerminal = Read-EnumTerminal $winpeasJob
+        if ($winpeasTerminal) {
+            $deferredWeakService = $false
+            if ($winpeasTerminal.status -ne 'cleanup-failed') {
+                $weakLabState = Get-WeakServiceLabState
+                if ($weakLabState) {
+                    Write-Finding 'local-elevation' 'weak-service-lab prerequisites rechecked after WinPEAS cleanup'
+                    if (-not (Confirm-WeakServiceChange)) {
+                        Write-Attempt 'weak-service-lab' 'service-change-approval-declined'
+                        $fastAttemptedRecipe = 'weak-service-lab'
+                    } else {
+                        Write-Attempt 'weak-service-lab' 'service-change-approved'
+                        $fastAttemptedRecipe = 'weak-service-lab'
+                        if (Invoke-Recipe 'weak-service-lab') {
+                            $fastSuccessRecipe = 'weak-service-lab'
+                            Write-Attempt 'weak-service-lab' 'proof-success'
+                            if (-not $FinishBgEnum -and -not $NoShell) {
+                                foreach ($entry in $enumJobs) { Stop-EnumJob $entry }
+                            }
+                        } else { Write-Attempt 'weak-service-lab' 'proof-failed' }
+                    }
+                }
+            }
+        }
     }
     Start-Sleep -Milliseconds 250
 }

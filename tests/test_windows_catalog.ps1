@@ -53,6 +53,7 @@ New-Item -ItemType Directory -Path $testRoot | Out-Null
 try {
     $curatedOnly = Join-Path $testRoot 'curated-only'
     Copy-Item -LiteralPath (Join-Path $root 'catalog') -Destination $curatedOnly -Recurse
+    Get-ChildItem -LiteralPath $curatedOnly -Recurse -File | ForEach-Object { $_.IsReadOnly = $false }
     Remove-Item -LiteralPath (Join-Path $curatedOnly 'local-eop.tsv')
     $curatedQuery = @(& $source -Cve 'CVE-2023-4911' -CatalogDir $curatedOnly)
     if ($curatedQuery[1] -notmatch 'indexed-review-only\tlinux\tglibc') {
@@ -81,6 +82,7 @@ try {
     $missingDetails = @(& $source -CveDetails 'CVE-2025-32463' -CatalogDir $tampered)
     if ($missingDetails[1] -notmatch 'details-not-installed') { throw 'Missing detail sidecar was inferred' }
     Copy-Item -LiteralPath (Join-Path $root 'catalog/local-eop-details.tsv') -Destination (Join-Path $tampered 'local-eop-details.tsv')
+    (Get-Item -LiteralPath (Join-Path $tampered 'local-eop-details.tsv')).IsReadOnly = $false
     Add-Content -LiteralPath (Join-Path $tampered 'local-eop-details.tsv') -Value 'tampered'
     $global:LASTEXITCODE = 0
     & $source -CveDetails 'CVE-2025-32463' -CatalogDir $tampered | Out-Null
@@ -99,6 +101,7 @@ try {
     if ($rows[3].status -ne 'unindexed') { throw 'Unknown CVE state failed' }
     $complete = Join-Path $testRoot 'complete'
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'fixtures/cve-details/catalog') -Destination $complete -Recurse
+    Get-ChildItem -LiteralPath $complete -Recurse -File | ForEach-Object { $_.IsReadOnly = $false }
     $detailSource = Get-Content -LiteralPath (Join-Path $complete 'all-cve-details-source.json') -Raw | ConvertFrom-Json
     $generation = Join-Path (Join-Path $complete 'all-cve-details') $detailSource.shards_sha256
     $longId = 'CVE-2020-9999999999999999999'

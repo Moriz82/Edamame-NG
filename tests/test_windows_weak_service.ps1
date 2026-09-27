@@ -11,6 +11,25 @@ foreach ($relative in @('Edamame-NG.ps1', 'lib\WeakServiceLab.ps1', 'tests\fixtu
 $tokens = $null
 $errors = $null
 $runnerAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'Edamame-NG.ps1'), [ref]$tokens, [ref]$errors)
+$runnerText = Get-Content -LiteralPath (Join-Path $root 'Edamame-NG.ps1') -Raw
+$weakGuard = $runnerText.IndexOf("if (`$fastRecipe -eq 'weak-service-lab' -and `$winpeasJob)", [StringComparison]::Ordinal)
+if ($runnerText.IndexOf("if (`$fastRecipe -eq 'weak-service-lab' -and `$enumJobs.Count -gt 0)", [StringComparison]::Ordinal) -ge 0 -or
+    $weakGuard -lt 0) {
+    throw 'Weak-service pipe must be deferred only when WinPEAS is active'
+}
+$weakApproval = $runnerText.IndexOf("Write-Attempt `$fastRecipe 'service-change-approved'", [StringComparison]::Ordinal)
+$weakInvoke = $runnerText.IndexOf('if (Invoke-Recipe $fastRecipe)', [StringComparison]::Ordinal)
+if ($weakApproval -lt 0 -or $weakInvoke -lt 0 -or
+    $weakGuard -ge $weakApproval -or $weakApproval -ge $weakInvoke) {
+    throw 'Weak-service collector guard, approval, and proof are out of order'
+}
+$watchLoop = $runnerText.IndexOf('while (@($enumJobs | Where-Object', [StringComparison]::Ordinal)
+$weakWatch = $runnerText.IndexOf('if ($deferredWeakService -and $winpeasJob)', [StringComparison]::Ordinal)
+$winpeasComplete = $runnerText.IndexOf('$winpeasStatus = if ($winpeasJob) { Complete-EnumJob', [StringComparison]::Ordinal)
+if ($watchLoop -lt 0 -or $weakWatch -le $watchLoop -or
+    $winpeasComplete -le $weakWatch) {
+    throw 'Deferred weak-service proof must run during the collector watch loop'
+}
 $trustFn = $runnerAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-TrustedSystemBinary' }, $true)
 . ([scriptblock]::Create($trustFn.Extent.Text))
 . (Join-Path $root 'lib\WeakServiceLab.ps1')

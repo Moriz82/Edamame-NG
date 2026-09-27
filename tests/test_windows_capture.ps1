@@ -13,6 +13,7 @@ $testRoot = Join-Path $env:TEMP ([IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $testRoot | Out-Null
 $passed = $false
 $failed = $false
+$locker = $null
 try {
     $script:ShowRawOutput = $false
     $cmdExe = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
@@ -20,6 +21,33 @@ try {
     $output = Join-Path $testRoot 'success.txt'
     if ((Invoke-CapturedProcess $cmdExe '/d /c echo smoke' $output 10) -ne 'checked') { throw 'good process was not checked' }
     if ((Get-Content -LiteralPath $output -Raw) -notmatch 'smoke') { throw 'stdout was not captured' }
+    $output = Join-Path $testRoot 'shared-writer.txt'
+    $lockReady = Join-Path $testRoot 'writer-ready.txt'
+    $locker = Start-Job -ScriptBlock {
+        param($path, $ready)
+        $stream = [IO.File]::Open($path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::Write,
+            ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        try {
+            [IO.File]::WriteAllText($ready, 'ready')
+            Start-Sleep -Seconds 8
+        } finally { $stream.Dispose() }
+    } -ArgumentList "$output.stdout", $lockReady
+    for ($i = 0; $i -lt 100 -and -not (Test-Path -LiteralPath $lockReady); $i++) {
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not (Test-Path -LiteralPath $lockReady)) { throw 'Outside writer did not open capture file' }
+    if ((Invoke-CapturedProcess $cmdExe '/d /c echo shared-smoke' $output 10) -ne 'partial') {
+        throw 'Capture with outside writer was not marked partial'
+    }
+    if (-not (Wait-Job -Job $locker -Timeout 10)) { throw 'Outside writer did not exit' }
+    if ((Get-Content -LiteralPath $output -Raw) -notmatch 'shared-smoke') {
+        throw 'Shared-writer capture was not preserved'
+    }
+    if (-not (Test-Path -LiteralPath "$output.stdout")) { throw 'Shared raw part was not retained' }
+    $sharedMarker = Get-Content -LiteralPath "$output.terminal.json" -Raw | ConvertFrom-Json
+    if ($sharedMarker.status -ne 'partial') { throw 'Shared snapshot terminal was not partial' }
+    Remove-Job -Job $locker -Force
+    $locker = $null
     $output = Join-Path $testRoot 'timeout.txt'
     $status = Invoke-CapturedProcess $psExe '-NoProfile -Command "Write-Output started; Start-Sleep -Seconds 4"' $output 1
     if ($status -ne 'timeout') { throw "slow process status: $status" }
@@ -29,17 +57,19 @@ try {
     if ($status -ne 'timeout') { throw "nested process status: $status" }
     if ((Get-Content -LiteralPath $output -Raw) -notmatch 'started') { throw 'nested partial output was not preserved' }
     $lateTimeout = Join-Path $testRoot 'late-timeout-child.txt'
+    $timeoutChildReady = Join-Path $testRoot 'timeout-child-ready.txt'
     $rootStartedTimeout = Join-Path $testRoot 'root-started-timeout.txt'
-    $lateTimeoutCommand = "Start-Sleep -Seconds 4; Set-Content -LiteralPath '$($lateTimeout.Replace("'", "''"))' -Value late -Encoding ASCII"
+    $lateTimeoutCommand = "Set-Content -LiteralPath '$($timeoutChildReady.Replace("'", "''"))' -Value ready -Encoding ASCII; Start-Sleep -Seconds 12; Set-Content -LiteralPath '$($lateTimeout.Replace("'", "''"))' -Value late -Encoding ASCII"
     $lateTimeoutEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($lateTimeoutCommand))
     $timeoutRootCommand = "Start-Process -FilePath '$($psExe.Replace("'", "''"))' -ArgumentList '-NoProfile -EncodedCommand $lateTimeoutEncoded'; Set-Content -LiteralPath '$($rootStartedTimeout.Replace("'", "''"))' -Value started -Encoding ASCII; Write-Output root-exited"
     $timeoutRootArgs = '/NoProfile -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($timeoutRootCommand))
     $output = Join-Path $testRoot 'root-first-timeout.txt'
-    if ((Invoke-CapturedProcess $psExe $timeoutRootArgs $output 1) -ne 'timeout') {
+    if ((Invoke-CapturedProcess $psExe $timeoutRootArgs $output 6) -ne 'timeout') {
         throw 'root-exits-first timeout status was not timeout'
     }
     if (-not (Test-Path -LiteralPath $rootStartedTimeout)) { throw 'Timeout case did not start a descendant' }
-    Start-Sleep -Seconds 5
+    if (-not (Test-Path -LiteralPath $timeoutChildReady)) { throw 'Timeout descendant never became ready' }
+    Start-Sleep -Seconds 13
     if (Test-Path -LiteralPath $lateTimeout) { throw 'descendant survived Job Object timeout' }
     $output = Join-Path $testRoot 'failure.txt'
     if ((Invoke-CapturedProcess $cmdExe '/d /c exit 7' $output 10) -ne 'partial') { throw 'nonzero exit was accepted' }
@@ -70,6 +100,10 @@ try {
     $failed = $true
     [Console]::Error.WriteLine($_.Exception.ToString())
 } finally {
+    if ($locker) {
+        Stop-Job -Job $locker -ErrorAction SilentlyContinue
+        Remove-Job -Job $locker -Force -ErrorAction SilentlyContinue
+    }
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 if ($failed -or -not $passed) { exit 1 }

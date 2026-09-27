@@ -12,6 +12,7 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName()
 New-Item -ItemType Directory -Path $testRoot | Out-Null
 $passed = $false
 $failed = $false
+$sharedLock = $null
 try {
     $ToolTimeoutSeconds = 10
     $script:ShowRawOutput = $false
@@ -50,6 +51,42 @@ try {
     if ([Math]::Max($starts[0], $starts[1]) -ge [Math]::Min($ends[0], $ends[1])) {
         throw 'Collectors did not overlap'
     }
+    $sharedWorker = Join-Path $testRoot 'shared-worker.ps1'
+    "Write-Output started; Start-Sleep -Seconds 15" | Set-Content -LiteralPath $sharedWorker -Encoding ASCII
+    $ToolTimeoutSeconds = 6
+    $sharedOutput = Join-Path $testRoot 'shared-timeout.txt'
+    $shared = Start-EnumJob 'shared-timeout' $exe "-NoProfile -File `"$sharedWorker`"" $sharedOutput
+    $sharedReady = Join-Path $testRoot 'shared-ready.txt'
+    $sharedLock = Start-Job -ScriptBlock {
+        param($path, $ready)
+        $stream = $null
+        for ($i = 0; $i -lt 100 -and -not $stream; $i++) {
+            try {
+                $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Write,
+                    ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+            } catch [IO.IOException] { Start-Sleep -Milliseconds 100 }
+        }
+        if (-not $stream) { throw 'Outside writer could not open the live capture' }
+        try {
+            [IO.File]::WriteAllText($ready, 'ready')
+            Start-Sleep -Seconds 15
+        } finally { $stream.Dispose() }
+    } -ArgumentList "$sharedOutput.stdout", $sharedReady
+    $readyDeadline = [DateTime]::UtcNow.AddSeconds(10)
+    while (-not (Test-Path -LiteralPath $sharedReady) -and [DateTime]::UtcNow -lt $readyDeadline) {
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not (Test-Path -LiteralPath $sharedReady)) { throw 'Outside writer never held the live capture' }
+    if ((Complete-EnumJob $shared) -ne 'timeout') { throw 'Timed-out shared capture lost its terminal status' }
+    $sharedMarker = Get-Content -LiteralPath $shared.Terminal -Raw | ConvertFrom-Json
+    if ($sharedMarker.status -ne 'timeout' -or -not (Test-Path -LiteralPath $sharedOutput) -or
+        -not (Test-Path -LiteralPath "$sharedOutput.stdout")) {
+        throw 'Timed-out shared snapshot or raw part was not retained'
+    }
+    if (-not (Wait-Job -Job $sharedLock -Timeout 20)) { throw 'Outside writer did not exit' }
+    Remove-Job -Job $sharedLock -Force
+    $sharedLock = $null
+    $ToolTimeoutSeconds = 10
     $slow = Join-Path $testRoot 'slow.ps1'
     "Write-Output 'started'; Start-Sleep -Seconds 8; Write-Output 'late'" |
         Set-Content -LiteralPath $slow -Encoding ASCII
@@ -81,6 +118,30 @@ try {
     if ((Complete-EnumJob $descendant) -ne 'partial-after-proof') { throw 'Descendant stop was not partial' }
     Start-Sleep -Seconds 5
     if (Test-Path -LiteralPath $descendantMarker) { throw 'Descendant survived cancellation' }
+
+    $expiredReady = Join-Path $testRoot 'expired-descendant-ready.txt'
+    $expiredMarker = Join-Path $testRoot 'expired-descendant-late.txt'
+    $expiredCode = "Set-Content -LiteralPath '$($expiredReady.Replace("'", "''"))' -Value ready -Encoding ASCII; Start-Sleep -Seconds 8; Set-Content -LiteralPath '$($expiredMarker.Replace("'", "''"))' -Value late -Encoding ASCII"
+    $expiredEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($expiredCode))
+    $expiredWorker = Join-Path $testRoot 'expired-descendant.ps1'
+    "Start-Process -FilePath '$($exe.Replace("'", "''"))' -ArgumentList '-NoProfile -EncodedCommand $expiredEncoded'; Write-Output started; Start-Sleep -Seconds 60" |
+        Set-Content -LiteralPath $expiredWorker -Encoding ASCII
+    $ToolTimeoutSeconds = 30
+    $expired = Start-EnumJob 'expired' $exe "-NoProfile -File `"$expiredWorker`"" (Join-Path $testRoot 'expired.txt')
+    $readyDeadline = [DateTime]::UtcNow.AddSeconds(10)
+    while (-not (Test-Path -LiteralPath $expiredReady) -and [DateTime]::UtcNow -lt $readyDeadline) {
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not (Test-Path -LiteralPath $expiredReady)) { throw 'Expired-deadline descendant did not start' }
+    $expired.Deadline = [DateTime]::UtcNow.AddSeconds(-([int]$expired.GraceSeconds + 1))
+    $expiredStatus = Complete-EnumJob $expired
+    if ($expiredStatus -ne 'partial-after-proof') {
+        throw "Expired deadline skipped the fresh cancellation grace: $expiredStatus"
+    }
+    if (-not (Test-Path -LiteralPath $expired.Terminal)) { throw 'Expired-deadline terminal was not published' }
+    Start-Sleep -Seconds 9
+    if (Test-Path -LiteralPath $expiredMarker) { throw 'Expired-deadline descendant survived cancellation' }
+    $ToolTimeoutSeconds = 10
 
     $terminal = Start-EnumJob 'terminal' $exe "-NoProfile -File `"$worker`"" (Join-Path $testRoot 'terminal.txt')
     if ((Complete-EnumJob $terminal) -ne 'checked') { throw 'Normal terminal collector failed' }
@@ -121,12 +182,21 @@ try {
     if ($runnerText.IndexOf('$winpeasStatus -ne ''cleanup-failed''', [StringComparison]::Ordinal) -lt 0) {
         throw 'WinPEAS fallback is not blocked after cleanup failure'
     }
+    $stopBeforeProof = $runnerText.IndexOf("if (-not `$FinishBgEnum -and -not `$NoShell -and `$fastRecipe -in @('already-system', 'already-admin'))", [StringComparison]::Ordinal)
+    $stopAfterProof = $runnerText.IndexOf("if (-not `$FinishBgEnum -and -not `$NoShell) {`n                foreach (`$entry in `$enumJobs) { Stop-EnumJob `$entry }", [StringComparison]::Ordinal)
+    if ($stopBeforeProof -lt 0 -or $stopAfterProof -lt 0 -or $stopBeforeProof -ge $stopAfterProof) {
+        throw 'Foreground collector cleanup policy is missing or reordered'
+    }
     $passed = $true
     'PowerShell concurrent capture and live CVE screening passed'
 } catch {
     $failed = $true
     [Console]::Error.WriteLine($_.Exception.ToString())
 } finally {
+    if ($sharedLock) {
+        Stop-Job -Job $sharedLock -ErrorAction SilentlyContinue
+        Remove-Job -Job $sharedLock -Force -ErrorAction SilentlyContinue
+    }
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 if ($failed -or -not $passed) { exit 1 }
