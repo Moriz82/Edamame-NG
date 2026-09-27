@@ -1684,6 +1684,42 @@ foreach ($area in @(
 $weakCoverage = if ($weakLabState) { 'checked' } else { 'unsupported' }
 Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "Standard-user SYSTEM recipe`t$weakCoverage`texact EdamameWeakSvc fixture only"
 
+# Name the individual checklist sub-items, so the record states which specific
+# conditions were addressed instead of leaving a reader to infer them from a
+# parent row. Each carries its own status; none inherits a parent claim.
+$hostSubItems = @(
+    'Check OS version, hostname, IP and distribution.',
+    'What user are we? User enumeration.',
+    'List of files that could potentially contain passwords or other sensitive information:',
+    'Search for passwords in the REGISTRY:',
+    'Check if any patches or hotfixes are installed:',
+    'Installed applications')
+foreach ($area in $hostSubItems) {
+    Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "$area`t$enumStatus`texternal enumerator output only; this specific condition is not independently verified"
+}
+$domainSubItems = @(
+    'Machine Account Quota, SMB / LDAP Signing',
+    'Enabled Local Guest account on every machine + Enabled domain guest account',
+    'GPP Password', 'ASREP Roasting', 'Kerberoasting (every account including computers too)',
+    'Pre2k machines', 'Poisoning attacks (always run in ANALYZE mode first)',
+    'MITM attacks (last resort for IPv6 poisoning)', 'Coercion attacks (DFSCoerce)',
+    'Snaffler (SMB Shares)', 'Pass the password', 'Pass the hash',
+    'Local Admin Password reuse / blank password', 'Delegations',
+    'Enumerate DACLs + RBCD + Shadow creds', 'Group Policy', 'OUs', 'ADCS', 'IIS', 'WSUS',
+    'Exchange CVEs + Open SMTP Relay',
+    'MSSQL (impersonation, relay ntlmv2 hash, sql links, xp_cmdshell, external scripts enabled, sql server agent jobs, trustworthy databases, mssql privesc)',
+    'Ntlmv1 https://github.com/fox-it/cve-2019-1040-scanner',
+    'Easier way, perform an LM downgrade with Responder', 'SMBv1',
+    'NTLM Relaying (SMB to SMB, SMB to HTTP, HTTP to LDAP, Reflection)',
+    'CVEs: ZeroLogon, PrintNightmare, NoPAC, BadSuccessor, smbghost',
+    'Privileged groups', 'Tombstone objects (who has reanimate rights)',
+    'StrongCertificateBindingEnforcement reg key not set to 2', 'Defender Exclusions',
+    'Forests/Trusts')
+foreach ($area in $domainSubItems) {
+    $status = if ($domainJoined) { 'unsupported' } else { 'inapplicable' }
+    Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "$area`t$status`tdomain sub-item with no reviewed automatic recipe; the parent Active Directory row does not assert it"
+}
+
 # Alerts above precede these final output filenames.
 foreach ($name in @('winpeas-output.txt', 'winpeas-binary-partial.txt', 'privesccheck-output.txt', 'sharphound-output.txt')) {
     $from = Join-Path $capture $name

@@ -168,7 +168,9 @@ shellcheck -S warning edamame-ng.sh
 python3 tests/test_linux.py
 python3 tests/test_credential_linux.py
 python3 tests/test_failure_paths.py
+python3 tests/test_coverage_mapping.py
 python3 tests/test_catalog.py
+python3 tests/benchmark.py
 pwsh -NoProfile -File tests/check-ps-parse.ps1
 pwsh -NoProfile -File tests/test_powershell3_compat.ps1
 pwsh -NoProfile -File tests/test_release.ps1
@@ -178,7 +180,7 @@ pwsh -NoProfile -File tests/test_windows_async.ps1
 pwsh -NoProfile -File tests/test_windows_credential.ps1
 ```
 
-`tests/test_powershell3_compat.ps1` is a token and AST gate that fails on constructs a Windows PowerShell 3.0 host does not have, so a newer-engine dependency is caught here rather than on a 2012 guest. `tests/test_credential_linux.py` and `tests/test_windows_credential.ps1` use fake local authenticators and a loopback listener; they attempt no authentication against any endpoint and read no secret from an enumerator. `tests/test_failure_paths.py` feeds collectors output that imitates instructions, checks that a catalog PoC is never executed, and checks the unwritable, symlinked, size-limited, and interrupted paths.
+`tests/test_powershell3_compat.ps1` is a token and AST gate that fails on constructs a Windows PowerShell 3.0 host does not have, so a newer-engine dependency is caught here rather than on a 2012 guest. `tests/test_credential_linux.py` and `tests/test_windows_credential.ps1` use fake local authenticators and a loopback listener; they attempt no authentication against any endpoint and read no secret from an enumerator. `tests/test_failure_paths.py` feeds collectors output that imitates instructions, checks that a catalog PoC is never executed, and checks the unwritable, symlinked, size-limited, and interrupted paths. `tests/test_coverage_mapping.py` checks that every heading in `tests/fixtures/checklist-headings.tsv` has a coverage row, with a reason, in a real Linux run and in the Windows runner. `tests/benchmark.py` reports latency, CPU, memory, and collector overlap; it measures and asserts nothing.
 
 On a disposable Windows guest, `tests/test_psexec.ps1 -ArchivePath <verified-PSTools.zip>` checks official archive extraction, Authenticode, SHA-256, verified-cache fallback, and tamper rejection without contacting the network. It requires the current official ZIP as an external fixture.
 
