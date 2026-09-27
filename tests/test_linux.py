@@ -160,6 +160,34 @@ else:
                  "--output-dir", str(runs), "--no-shell", check=False)
     assert denied.returncode == 1 and "no longer works" in denied.stderr
     assert len(marker.read_text().splitlines()) == 4
+
+    # /usr/bin/python3 is a symlink to the versioned interpreter on every
+    # mainstream distribution, and getcap does not follow symlinks. The recipe
+    # must resolve the link first, or a cap_setuid interpreter is recorded as
+    # not met while it actually escalates.
+    cap_dir = base / "cap-interpreter"
+    cap_dir.mkdir()
+    versioned = cap_dir / "python3.13"
+    write(versioned, "#!/bin/sh\n[ \"$1\" = -c ] && exit 0\nexit 1\n")
+    (fake / "python3").symlink_to(versioned)
+    # Reports the capability only for the real target, never through the link.
+    write(fake / "getcap", "#!/bin/sh\ncase \"$1\" in */python3.13) echo \"$1 cap_setuid=ep\";; esac\nexit 0\n")
+    cap_env = dict(env, EDAMAME_TEST_NO_SUDO="1")
+    cap_runs = base / "cap-runs"
+    cap = run(ROOT / "edamame-ng.sh", cap_env, "--scan", "--no-shell",
+              "--output-dir", str(cap_runs), "--tool-dir", str(tools))
+    assert "python-cap-setuid independently verified" in cap.stdout, cap.stdout
+    cap_run = next(cap_runs.iterdir())
+    assert "python-cap-setuid\tproof-success" in (cap_run / "attempts.tsv").read_text()
+    # Without the capability the same route must stay refused.
+    write(fake / "getcap", "#!/bin/sh\nexit 0\n")
+    plain_runs = base / "plain-runs"
+    plain = run(ROOT / "edamame-ng.sh", cap_env, "--scan", "--no-shell",
+                "--output-dir", str(plain_runs), "--tool-dir", str(tools))
+    assert "python-cap-setuid" not in plain.stdout, plain.stdout
+    assert "No supported local escalation recipe verified" in plain.stdout
+    (fake / "python3").unlink()
+    write(fake / "getcap", "#!/bin/sh\nexit 1\n")
     duplicate_catalog = base / "duplicate-catalog"
     shutil.copytree(ROOT / "catalog", duplicate_catalog)
     with (duplicate_catalog / "curated-eop.tsv").open("a") as supplement:
