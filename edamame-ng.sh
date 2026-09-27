@@ -265,7 +265,7 @@ cve_details_batch() {
         done < "$temporary/ids"
         continue
       fi
-      IFS=$'\t' read -r key digest count bytes expanded <<< "$entry"
+      IFS=$'\t' read -r key digest count bytes expanded < <(printf '%s\n' "$entry")
       asset=$ALL_DETAILS_ROOT/$key
       if [[ -f $asset && ! -L $asset && ! -L ${asset%/*} && $(wc -c < "$asset") -eq $bytes && $(sha256_file "$asset") == "$digest" ]] &&
         gzip -dc -- "$asset" | head -c "$((expanded+1))" | fold -b -w 16777216 | LC_ALL=C awk -F '\t' -v key="$key" -v rows="$count" -v size="$expanded" '
@@ -331,7 +331,7 @@ if [[ -n $CVE_QUERY ]]; then
     ((poc_found)) || printf '%s\tnot-indexed\t\t\t\t\n' "$CVE_QUERY"
   elif ((CVE_DETAILS_QUERY)); then
     printf 'cve\tstate\tdescription\taffected_json\treferences_json\treview_state\tsource_json\n'
-    if ! cve_details_batch <<< "$CVE_QUERY"; then
+    if ! cve_details_batch < <(printf '%s\n' "$CVE_QUERY"); then
       printf 'Offline CVE details failed integrity checks.\n' >&2
       exit 2
     fi
@@ -709,11 +709,20 @@ if [[ $MODE == resume ]]; then
   printf '[RESUME] %s on %s; checking prerequisites again.\n' "$recipe" "$host_name"
   RUN_DIR=${success_file%/success.tsv}
 else
-  mkdir -p "$RUN_BASE" "$CACHE_BASE" || exit 2
-  chmod 700 "$RUN_BASE" "$CACHE_BASE" || exit 2
+  mkdir -p "$RUN_BASE" "$CACHE_BASE" || {
+    printf 'Cannot create the run and cache directories under %s and %s.\n' "$RUN_BASE" "$CACHE_BASE" >&2
+    exit 2
+  }
+  chmod 700 "$RUN_BASE" "$CACHE_BASE" || {
+    printf 'Cannot restrict the run and cache directories to mode 700.\n' >&2
+    exit 2
+  }
   run_id="$(date -u +%Y%m%dT%H%M%SZ)-${host_name}-$$"
   RUN_DIR="$RUN_BASE/$run_id"
-  mkdir -m 700 "$RUN_DIR" "$RUN_DIR/.capture" || exit 2
+  mkdir -m 700 "$RUN_DIR" "$RUN_DIR/.capture" || {
+    printf 'Cannot create a private run directory at %s.\n' "$RUN_DIR" >&2
+    exit 2
+  }
   : > "$RUN_DIR/tools.tsv"
   : > "$RUN_DIR/findings.tsv"
   : > "$RUN_DIR/attempts.tsv"
@@ -909,10 +918,12 @@ enum_cleanup_failed=0
 
 enum_group_live() {
   local group=$1 exclude=${2:-0} snapshot
+  # A pipe, not a here-string: a here-string needs a temporary file, and a full
+  # filesystem would make this safety check silently report "nothing alive".
   snapshot=$(ps -e -o pid= -o pgid= -o stat=) || return 2
-  awk -v group="$group" -v exclude="$exclude" '
+  printf '%s\n' "$snapshot" | awk -v group="$group" -v exclude="$exclude" '
     $2 == group && $1 != exclude && $3 !~ /^Z/ { live=1 }
-    END { exit live ? 0 : 1 }' <<< "$snapshot"
+    END { exit live ? 0 : 1 }'
 }
 
 enum_supervise() {
@@ -972,7 +983,7 @@ start_enum_capture() {
   ((pending_signal == 0)) || exit "$pending_signal"
   ((monitor_enabled)) || set +m
   identity=$(ps -p "${enum_pids[$index]}" -o pgid= -o lstart=)
-  read -r group _ <<< "$identity"
+  group=${identity%% *}
   own_group=$(ps -p "$$" -o pgid= | tr -d ' ')
   if [[ $group != "${enum_pids[$index]}" || $group == "$own_group" || -z $own_group ]]; then
     # No tool has been authorized yet; only the waiting supervisor exists.
@@ -1233,6 +1244,36 @@ done < "$cve_tmp"
 printf 'cve\tstate\tdescription\taffected_json\treferences_json\treview_state\tsource_json\n' > "$RUN_DIR/cve-details.tsv"
 if ! cve_details_batch < "$cve_tmp" >> "$RUN_DIR/cve-details.tsv"; then
   printf '[WARN] Offline CVE details failed integrity checks; withholding affected details.\n' >&2
+fi
+
+# A full filesystem, a write-only failure, or a lost artifact must not be
+# reported as a completed run. Check the decision record before claiming it.
+# A record file with no rows is honest; a missing one, or a missing header on a
+# file that always carries one, is not.
+artifact_problem=0
+for artifact in tools.tsv findings.tsv attempts.tsv coverage.tsv cve-candidates.tsv cve-index.tsv cve-details.tsv; do
+  if [[ ! -f $RUN_DIR/$artifact ]]; then
+    printf '[WARN] Final artifact %s is missing; this run is incomplete.\n' "$artifact" >&2
+    artifact_problem=1
+  fi
+done
+for artifact in cve-index.tsv cve-details.tsv; do
+  if [[ -f $RUN_DIR/$artifact && ! -s $RUN_DIR/$artifact ]]; then
+    printf '[WARN] Final artifact %s lost its header; this run is incomplete.\n' "$artifact" >&2
+    artifact_problem=1
+  fi
+done
+for index in 0 1; do
+  label=${enum_labels[$index]}
+  if [[ ${enum_statuses[$index]} != cleanup-failed && ${enum_finished[$index]} == 1 ]] \
+     && [[ ! -f $RUN_DIR/$label-output.txt && ! -f $RUN_DIR/.capture/$label-output.txt ]]; then
+    printf '[WARN] Raw output for %s is missing; this run is incomplete.\n' "$label" >&2
+    artifact_problem=1
+  fi
+done
+if ((artifact_problem)); then
+  printf '[RESULT] Incomplete run: see %s\n' "$RUN_DIR" >&2
+  exit 1
 fi
 printf '[SAVED] findings.tsv, coverage.tsv, attempts.tsv, tools.tsv\n'
 
