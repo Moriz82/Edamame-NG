@@ -22,6 +22,15 @@ CVE_QUERY=''
 QUERY_MODES=0
 POC_QUERY=0
 CVE_DETAILS_QUERY=0
+CRED_CHECK=0
+CRED_ACCOUNT=''
+CRED_ENDPOINT=''
+CRED_SERVICE=''
+CRED_SECRET_STDIN=0
+CRED_LOCKOUT_FILE=''
+CRED_LEDGER=''
+CRED_CONNECT_TIMEOUT=5
+CRED_RUN_TIMEOUT=20
 DETAILS_CATALOG_STATE=''
 ALL_DETAILS_STATE=''
 ALL_DETAILS_ROOT=''
@@ -39,6 +48,10 @@ Usage: edamame-ng.sh [--scan | --resume [RUN_ID]] [--output-dir DIR]
        edamame-ng.sh --cve CVE-YYYY-NNNN [--catalog-dir DIR]
        edamame-ng.sh --cve-details CVE-YYYY-NNNN [--catalog-dir DIR]
        edamame-ng.sh --poc CVE-YYYY-NNNN [--catalog-dir DIR]
+       edamame-ng.sh --verify-credential --cred-account NAME --cred-endpoint HOST[:PORT]
+                      --cred-service smb|ssh [--cred-secret-stdin]
+                      [--cred-lockout-file FILE] [--cred-ledger FILE]
+                      [--cred-timeout SECONDS] [--output-dir DIR]
 Run with no mode to choose Resume (default) or Scan when a prior success exists.
 --tool-dir accepts local assets only when each has an adjacent .sha256 file.
 EOF
@@ -54,6 +67,14 @@ while (($#)); do
     --cve) (($# >= 2)) || { usage >&2; exit 2; }; CVE_QUERY=$2; QUERY_MODES=$((QUERY_MODES+1)); shift 2 ;;
     --cve-details) (($# >= 2)) || { usage >&2; exit 2; }; CVE_QUERY=$2; CVE_DETAILS_QUERY=1; QUERY_MODES=$((QUERY_MODES+1)); shift 2 ;;
     --poc) (($# >= 2)) || { usage >&2; exit 2; }; CVE_QUERY=$2; POC_QUERY=1; QUERY_MODES=$((QUERY_MODES+1)); shift 2 ;;
+    --verify-credential) CRED_CHECK=1; shift ;;
+    --cred-account) (($# >= 2)) || { usage >&2; exit 2; }; CRED_ACCOUNT=$2; shift 2 ;;
+    --cred-endpoint) (($# >= 2)) || { usage >&2; exit 2; }; CRED_ENDPOINT=$2; shift 2 ;;
+    --cred-service) (($# >= 2)) || { usage >&2; exit 2; }; CRED_SERVICE=$2; shift 2 ;;
+    --cred-secret-stdin) CRED_SECRET_STDIN=1; shift ;;
+    --cred-lockout-file) (($# >= 2)) || { usage >&2; exit 2; }; CRED_LOCKOUT_FILE=$2; shift 2 ;;
+    --cred-ledger) (($# >= 2)) || { usage >&2; exit 2; }; CRED_LEDGER=$2; shift 2 ;;
+    --cred-timeout) (($# >= 2)) || { usage >&2; exit 2; }; CRED_RUN_TIMEOUT=$2; shift 2 ;;
     --enable-cve-2025-32463-lab) LAB_CVE_ENABLED=1; shift ;;
     --no-shell) NO_SHELL=1; shift ;;
     --offline) OFFLINE=1; shift ;;
@@ -65,6 +86,10 @@ while (($#)); do
 done
 if ((QUERY_MODES > 1)); then
   printf 'Choose one CVE query mode.\n' >&2
+  exit 2
+fi
+if ((CRED_CHECK)) && ((QUERY_MODES)); then
+  printf 'Choose one CVE query or credential mode.\n' >&2
   exit 2
 fi
 CVE_POC="$CATALOG_DIR/pocs/CVE-2025-32463/sudo-chwoot.sh"
@@ -316,6 +341,300 @@ if [[ -n $CVE_QUERY ]]; then
     cve_lookup "$CVE_QUERY" any
   fi
   exit 0
+fi
+
+# Operator-supplied credential validation. The account, the secret, and the
+# discovered endpoint are supplied by the operator for this check only. Nothing
+# in this block reads a secret from collector output, a cache, or the catalog,
+# and no secret is written to an artifact.
+cred_mask() {
+  local value=$1
+  if ((${#value} <= 2)); then
+    printf '%s*' "${value:0:1}"
+  else
+    printf '%s***%s' "${value:0:1}" "${value: -1}"
+  fi
+}
+
+cred_stdin_sha256() {
+  local line
+  if command -v sha256sum >/dev/null 2>&1; then
+    line=$(sha256sum 2>/dev/null) || return 1
+  elif command -v shasum >/dev/null 2>&1; then
+    line=$(shasum -a 256 2>/dev/null) || return 1
+  else
+    return 1
+  fi
+  line=${line%% *}
+  [[ $line =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+  printf '%s\n' "$line"
+}
+
+cred_ledger_open() {
+  CRED_LEDGER=${CRED_LEDGER:-$CACHE_BASE/credential-ledger.tsv}
+  local dir=${CRED_LEDGER%/*} header first=''
+  [[ $dir == "$CRED_LEDGER" ]] && dir='.'
+  mkdir -p "$dir" 2>/dev/null || return 1
+  [[ ! -L $CRED_LEDGER ]] || return 1
+  header='key	service	endpoint	account	attempts	first_utc	last_utc'
+  if [[ ! -e $CRED_LEDGER ]]; then
+    (umask 077; : > "$CRED_LEDGER") || return 1
+  fi
+  [[ -f $CRED_LEDGER ]] || return 1
+  if IFS= read -r first < "$CRED_LEDGER"; then
+    [[ $first == "$header" ]] || return 1
+  else
+    printf '%s\n' "$header" >> "$CRED_LEDGER" || return 1
+  fi
+  chmod 600 "$CRED_LEDGER" 2>/dev/null || return 1
+}
+
+cred_ledger_get() {
+  awk -F '\t' -v key="$CRED_KEY" 'FNR>1 && $1==key {print $5; exit}' "$CRED_LEDGER" 2>/dev/null
+}
+
+cred_ledger_add() {
+  local tmp="$CRED_LEDGER.$$"
+  (umask 077; awk -F '\t' -v key="$CRED_KEY" -v n="$CRED_ATTEMPTS" -v first="$CRED_FIRST_UTC" \
+      -v last="$CRED_NOW" -v svc="$CRED_SERVICE" -v ep="$CRED_HOST:$CRED_PORT" -v acct="$CRED_ACCOUNT_MASKED" '
+    BEGIN { OFS="\t"; seen=0 }
+    FNR==1 { print; next }
+    $1==key { seen=1; $5=n; $7=last; print; next }
+    { print }
+    END { if (!seen) print key, svc, ep, acct, n, first, last }' "$CRED_LEDGER" > "$tmp") || return 1
+  mv -f "$tmp" "$CRED_LEDGER" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$CRED_LEDGER" 2>/dev/null || return 1
+}
+
+cred_file_mode() {
+  local path=$1 mode
+  mode=$(/usr/bin/stat -c %a "$path" 2>/dev/null) || mode=$(/usr/bin/stat -f %Lp "$path" 2>/dev/null) || return 1
+  [[ $mode =~ ^[0-7]+$ ]] || return 1
+  printf '%s\n' "$mode"
+}
+
+cred_policy() {
+  CRED_POLICY_BASIS='unverified-single-attempt'
+  CRED_POLICY_ALLOWED=1
+  CRED_POLICY_DIGEST=''
+  [[ -n $CRED_LOCKOUT_FILE ]] || return 0
+  local file=$CRED_LOCKOUT_FILE threshold mode
+  [[ -f $file && ! -L $file ]] || { printf 'Lockout policy file missing or not a regular file.\n' >&2; return 1; }
+  [[ -r $file ]] || { printf 'Lockout policy file unreadable.\n' >&2; return 1; }
+  mode=$(cred_file_mode "$file") || return 1
+  (( (8#$mode & 8#022) == 0 )) || { printf 'Lockout policy file is group or world writable.\n' >&2; return 1; }
+  threshold=$(awk -F= '/^[[:space:]]*lockout_threshold[[:space:]]*=/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$file")
+  [[ $threshold =~ ^[0-9]{1,3}$ ]] || { printf 'Lockout policy file needs an integer lockout_threshold.\n' >&2; return 1; }
+  threshold=$((10#$threshold))
+  ((threshold >= 1)) || { printf 'Lockout threshold must be at least 1.\n' >&2; return 1; }
+  CRED_POLICY_DIGEST=$(sha256_file "$file") || { printf 'Cannot hash lockout policy file.\n' >&2; return 1; }
+  [[ -n $CRED_POLICY_DIGEST ]] || { printf 'Cannot hash lockout policy file.\n' >&2; return 1; }
+  CRED_POLICY_ALLOWED=$(( threshold < 3 ? threshold : 3 ))
+  CRED_POLICY_BASIS="operator-policy-threshold-$threshold"
+}
+
+cred_run_bounded() {
+  local runner
+  for runner in /usr/bin/timeout /bin/timeout; do
+    if [[ -x $runner ]]; then
+      "$runner" "$CRED_RUN_TIMEOUT" "$@"
+      return $?
+    fi
+  done
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$CRED_RUN_TIMEOUT" "$@"
+    return $?
+  fi
+  "$@"
+}
+
+cred_tcp_reachable() {
+  local runner
+  for runner in /usr/bin/timeout /bin/timeout; do
+    if [[ -x $runner ]]; then
+      "$runner" "$CRED_CONNECT_TIMEOUT" "$BASH" -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$1" "$2" 2>/dev/null
+      return $?
+    fi
+  done
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$CRED_CONNECT_TIMEOUT" "$BASH" -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$1" "$2" 2>/dev/null
+    return $?
+  fi
+  "$BASH" -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$1" "$2" 2>/dev/null
+}
+
+cred_ssh_host_known() {
+  local host=$1 port=$2 file lookup
+  for file in "${HOME}/.ssh/known_hosts" /etc/ssh/ssh_known_hosts; do
+    [[ -f $file && -r $file ]] || continue
+    for lookup in "$host" "[$host]:$port"; do
+      if command -v ssh-keygen >/dev/null 2>&1; then
+        ssh-keygen -F "$lookup" -f "$file" >/dev/null 2>&1 && return 0
+      fi
+      if awk -v h="$lookup" '$1==h {found=1} END {exit !found}' "$file"; then
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+cred_adapter_available() {
+  case $1 in
+    smb) command -v smbclient >/dev/null 2>&1 ;;
+    ssh) command -v sshpass >/dev/null 2>&1 && command -v ssh >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+cred_smb_probe() {
+  local host=$1 port=$2 account=$3 name domain='' auth_dir auth_file rc
+  if [[ $account == *\\* ]]; then domain=${account%%\\*}; name=${account#*\\};
+  elif [[ $account == *@* ]]; then domain=${account#*@}; name=${account%%@*}; fi
+  auth_dir=$(mktemp -d "${TMPDIR:-/tmp}/edamame-cred.XXXXXXXX") || return 4
+  chmod 700 "$auth_dir" 2>/dev/null || { rm -rf "$auth_dir"; return 4; }
+  auth_file="$auth_dir/auth"
+  (umask 077; {
+    printf 'username = %s\n' "$name"
+    printf 'password = %s\n' "$CRED_SECRET"
+    [[ -z $domain ]] || printf 'domain = %s\n' "$domain"
+  } > "$auth_file") || { rm -rf "$auth_dir"; return 4; }
+  cred_run_bounded smbclient "//$host/IPC\$" -A "$auth_file" -N -m SMBDIGRAM -g -p "$port" -c quit >/dev/null 2>&1
+  rc=$?
+  rm -rf "$auth_dir" 2>/dev/null
+  return $rc
+}
+
+cred_ssh_probe() {
+  local host=$1 port=$2 account=$3
+  printf '%s\n' "$CRED_SECRET" | cred_run_bounded sshpass -d 0 ssh \
+    -o BatchMode=no -o NumberOfPasswordPrompts=1 \
+    -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+    -o KbdInteractiveAuthentication=no -o StrictHostKeyChecking=yes \
+    -o ConnectTimeout="$CRED_RUN_TIMEOUT" -p "$port" "$account@$host" true >/dev/null 2>&1
+}
+
+if ((CRED_CHECK)); then
+  if ((QUERY_MODES)); then printf 'Choose one CVE query or credential mode.\n' >&2; exit 2; fi
+  [[ -n $CRED_ACCOUNT && -n $CRED_ENDPOINT && -n $CRED_SERVICE ]] || {
+    printf 'Credential validation needs --cred-account, --cred-endpoint, and --cred-service.\n' >&2; exit 2; }
+  [[ $CRED_ACCOUNT =~ ^[A-Za-z0-9._@\\-]+$ ]] || { printf 'Invalid account name.\n' >&2; exit 2; }
+  (( ${#CRED_ACCOUNT} <= 256 )) || { printf 'Account name is longer than 256 characters.\n' >&2; exit 2; }
+  [[ $CRED_ENDPOINT =~ ^[A-Za-z0-9._-]+(:[0-9]+)?$ ]] || { printf 'Invalid endpoint.\n' >&2; exit 2; }
+  (( ${#CRED_ENDPOINT} <= 259 )) || { printf 'Endpoint is longer than 259 characters.\n' >&2; exit 2; }
+  case $CRED_SERVICE in
+    smb) CRED_DEFAULT_PORT=445 ;;
+    ssh)
+      CRED_DEFAULT_PORT=22
+      [[ $CRED_ACCOUNT != *\\* && $CRED_ACCOUNT != *@* ]] || {
+        printf 'The SSH adapter cannot express a domain-qualified account. Supply the local account name.\n' >&2
+        exit 2
+      } ;;
+    *) printf 'Unsupported credential service.\n' >&2; exit 2 ;;
+  esac
+  if [[ $CRED_ENDPOINT == *:* ]]; then
+    CRED_HOST=${CRED_ENDPOINT%%:*}
+    CRED_PORT=${CRED_ENDPOINT##*:}
+  else
+    CRED_HOST=$CRED_ENDPOINT
+    CRED_PORT=$CRED_DEFAULT_PORT
+  fi
+  [[ $CRED_PORT =~ ^[0-9]+$ ]] || { printf 'Invalid endpoint port.\n' >&2; exit 2; }
+  (( ${#CRED_PORT} <= 5 )) || { printf 'Invalid endpoint port.\n' >&2; exit 2; }
+  CRED_PORT=$((10#$CRED_PORT))
+  ((CRED_PORT >= 1 && CRED_PORT <= 65535)) || { printf 'Invalid endpoint port.\n' >&2; exit 2; }
+  [[ $CRED_RUN_TIMEOUT =~ ^[0-9]+$ ]] || { printf 'Invalid --cred-timeout.\n' >&2; exit 2; }
+  (( ${#CRED_RUN_TIMEOUT} <= 4 )) || { printf 'Invalid --cred-timeout.\n' >&2; exit 2; }
+  CRED_RUN_TIMEOUT=$((10#$CRED_RUN_TIMEOUT))
+  ((CRED_RUN_TIMEOUT >= 1 && CRED_RUN_TIMEOUT <= 300)) || { printf '--cred-timeout must be 1..300.\n' >&2; exit 2; }
+  ((CRED_RUN_TIMEOUT > CRED_CONNECT_TIMEOUT)) || CRED_CONNECT_TIMEOUT=$CRED_RUN_TIMEOUT
+  cred_ledger_open || { printf 'Credential ledger unavailable.\n' >&2; exit 2; }
+  cred_policy || exit 2
+  CRED_KEY=$(printf '%s|%s|%s' "$CRED_SERVICE" "$CRED_ACCOUNT" "$CRED_HOST:$CRED_PORT" | cred_stdin_sha256) || {
+    printf 'Cannot hash the credential key; a SHA-256 tool is required.\n' >&2; exit 2; }
+  CRED_NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  CRED_ACCOUNT_MASKED=$(cred_mask "$CRED_ACCOUNT")
+  CRED_ATTEMPTS=$(cred_ledger_get || true)
+  [[ $CRED_ATTEMPTS =~ ^[0-9]{1,6}$ ]] || CRED_ATTEMPTS=0
+  CRED_FIRST_UTC=$CRED_NOW
+  cred_host_name=$(hostname -s 2>/dev/null || hostname)
+  cred_host_name=${cred_host_name//[^A-Za-z0-9._-]/_}
+  cred_dir="$RUN_BASE/credentials"
+  mkdir -p "$cred_dir" && chmod 700 "$cred_dir" || { printf 'Cannot create credential results directory.\n' >&2; exit 2; }
+  CRED_RUN_DIR="$cred_dir/$CRED_NOW-$cred_host_name-$$"
+  CRED_RUN_DIR=${CRED_RUN_DIR//:/-}
+  mkdir -m 700 "$CRED_RUN_DIR" || { printf 'Cannot create credential result directory.\n' >&2; exit 2; }
+  printf 'timestamp\tservice\tendpoint\taccount\tpolicy\tpolicy_sha256\tallowed\tattempt\tresult\n' > "$CRED_RUN_DIR/attempts.tsv"
+  cred_record() {
+    printf '%s\t%s\t%s:%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$CRED_NOW" "$CRED_SERVICE" "$CRED_HOST" "$CRED_PORT" \
+      "$CRED_ACCOUNT_MASKED" "$CRED_POLICY_BASIS" "$CRED_POLICY_DIGEST" "$CRED_POLICY_ALLOWED" "$1" "$2" \
+      >> "$CRED_RUN_DIR/attempts.tsv"
+  }
+  if ((CRED_ATTEMPTS >= CRED_POLICY_ALLOWED)); then
+    cred_record "$((CRED_ATTEMPTS + 1))" limit-reached
+    printf '[CRED] Refused %s at %s:%s: %d of %d permitted attempts already recorded (policy %s). No authentication was attempted.\n' \
+      "$CRED_ACCOUNT_MASKED" "$CRED_HOST" "$CRED_PORT" "$CRED_ATTEMPTS" "$CRED_POLICY_ALLOWED" "$CRED_POLICY_BASIS" >&2
+    printf '[SAVED] %s/attempts.tsv\n' "$CRED_RUN_DIR"
+    exit 2
+  fi
+  cred_adapter_available "$CRED_SERVICE" || {
+    cred_record "$((CRED_ATTEMPTS + 1))" adapter-unavailable
+    printf '[CRED] No local %s authenticator. No secret was read and no authentication was attempted.\n' "$CRED_SERVICE" >&2
+    printf '[SAVED] %s/attempts.tsv\n' "$CRED_RUN_DIR"
+    exit 2
+  }
+  if [[ $CRED_SERVICE == ssh ]] && ! cred_ssh_host_known "$CRED_HOST" "$CRED_PORT"; then
+    cred_record "$((CRED_ATTEMPTS + 1))" host-key-unverified
+    printf '[CRED] No known_hosts entry for %s. Host key verification is not weakened. No authentication was attempted.\n' "$CRED_HOST" >&2
+    printf '[SAVED] %s/attempts.tsv\n' "$CRED_RUN_DIR"
+    exit 2
+  fi
+  if ! cred_tcp_reachable "$CRED_HOST" "$CRED_PORT"; then
+    cred_record "$((CRED_ATTEMPTS + 1))" endpoint-unreachable
+    printf '[CRED] Cannot reach %s:%s. No authentication was attempted.\n' "$CRED_HOST" "$CRED_PORT" >&2
+    printf '[SAVED] %s/attempts.tsv\n' "$CRED_RUN_DIR"
+    exit 3
+  fi
+  CRED_SECRET=''
+  if ((CRED_SECRET_STDIN)); then
+    IFS= read -r CRED_SECRET || true
+  elif [[ -t 0 ]]; then
+    printf 'Secret for %s at %s:%s: ' "$CRED_ACCOUNT_MASKED" "$CRED_HOST" "$CRED_PORT" >&2
+    IFS= read -rs CRED_SECRET || true
+    printf '\n' >&2
+  else
+    printf 'No secret input. Use --cred-secret-stdin or run on a terminal.\n' >&2
+    exit 2
+  fi
+  [[ -n $CRED_SECRET && ${#CRED_SECRET} -le 1024 ]] || { printf 'Secret missing or longer than 1024 characters.\n' >&2; exit 2; }
+  if [[ $CRED_SERVICE == smb ]]; then
+    cred_smb_probe "$CRED_HOST" "$CRED_PORT" "$CRED_ACCOUNT"
+    cred_rc=$?
+  else
+    cred_ssh_probe "$CRED_HOST" "$CRED_PORT" "$CRED_ACCOUNT"
+    cred_rc=$?
+  fi
+  CRED_SECRET=''
+  unset CRED_SECRET
+  CRED_ATTEMPTS=$((CRED_ATTEMPTS + 1))
+  cred_record "$CRED_ATTEMPTS" "$cred_rc"
+  cred_ledger_add || { printf 'Credential ledger update failed.\n' >&2; exit 2; }
+  case $cred_rc in
+    0)
+      printf '[CRED] Accepted: %s at %s:%s over %s. Attempt %d of %d (policy %s).\n' \
+        "$CRED_ACCOUNT_MASKED" "$CRED_HOST" "$CRED_PORT" "$CRED_SERVICE" "$CRED_ATTEMPTS" "$CRED_POLICY_ALLOWED" "$CRED_POLICY_BASIS"
+      cred_exit=0 ;;
+    124)
+      printf '[CRED] Timed out after %s s at %s:%s. Attempt %d of %d recorded; the authentication result is unknown.\n' \
+        "$CRED_RUN_TIMEOUT" "$CRED_HOST" "$CRED_PORT" "$CRED_ATTEMPTS" "$CRED_POLICY_ALLOWED" >&2
+      cred_exit=3 ;;
+    *)
+      printf '[CRED] Rejected: %s at %s:%s over %s. Attempt %d of %d (policy %s).\n' \
+        "$CRED_ACCOUNT_MASKED" "$CRED_HOST" "$CRED_PORT" "$CRED_SERVICE" "$CRED_ATTEMPTS" "$CRED_POLICY_ALLOWED" "$CRED_POLICY_BASIS" >&2
+      cred_exit=1 ;;
+  esac
+  printf '[SAVED] %s/attempts.tsv\n' "$CRED_RUN_DIR"
+  exit "$cred_exit"
 fi
 
 cat <<'EOF'

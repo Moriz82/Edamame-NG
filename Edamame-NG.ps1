@@ -17,7 +17,15 @@ param(
     [switch]$ApproveSystemService,
     [switch]$EnableWeakServiceLab,
     [switch]$ApproveServiceChange,
-    [switch]$NoShell
+    [switch]$NoShell,
+    [Parameter(ParameterSetName = 'Credential')][switch]$VerifyCredential,
+    [Parameter(ParameterSetName = 'Credential')][string]$CredAccount,
+    [Parameter(ParameterSetName = 'Credential')][string]$CredEndpoint,
+    [Parameter(ParameterSetName = 'Credential')][ValidateSet('smb')][string]$CredService = 'smb',
+    [Parameter(ParameterSetName = 'Credential')][switch]$CredSecretStdin,
+    [Parameter(ParameterSetName = 'Credential')][string]$CredLockoutFile,
+    [Parameter(ParameterSetName = 'Credential')][string]$CredLedger,
+    [Parameter(ParameterSetName = 'Credential')][ValidateRange(1, 300)][int]$CredTimeoutSeconds = 20
 )
 
 $ErrorActionPreference = 'Stop'
@@ -350,6 +358,271 @@ if ($Cve) {
         "$Cve`t$state`t`t`t`thttps://www.cve.org/CVERecord?id=$Cve"
     }
     return
+}
+
+# Operator-supplied credential validation. The account, the secret, and the
+# discovered endpoint are supplied by the operator for this check only. No
+# collector output, cache, or catalog value is ever used as a secret, and no
+# secret is written to an artifact or a command line.
+function Get-CredMasked([string]$Value) {
+    if ($Value.Length -le 2) { return "$($Value.Substring(0, 1))*" }
+    return "$($Value.Substring(0, 1))***$($Value.Substring($Value.Length - 1, 1))"
+}
+
+function Set-PrivateFile([string]$Path) {
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl = New-Object System.Security.AccessControl.FileSecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $allow = [System.Security.AccessControl.AccessControlType]::Allow
+    $full = [System.Security.AccessControl.FileSystemRights]::FullControl
+    foreach ($sid in @($identity, (New-Object System.Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-18'),
+                       (New-Object System.Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-32-544'))) {
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList $sid, $full, $allow
+        $acl.AddAccessRule($rule)
+    }
+    (Get-Item -LiteralPath $Path -Force).SetAccessControl($acl)
+}
+
+function Test-PrivateFileAcl([string]$Path) {
+    $permitted = @(
+        [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value, 'S-1-5-18', 'S-1-5-32-544')
+    foreach ($rule in (Get-Acl -LiteralPath $Path).Access) {
+        $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+        if ($sid -notin $permitted) { return $false }
+    }
+    return $true
+}
+
+function Get-CredLedgerPath {
+    if ($CredLedger) { return $CredLedger }
+    return (Join-Path $cacheBase 'credential-ledger.tsv')
+}
+
+function Get-CredLedgerAttempts([string]$Path, [string]$Key) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return 0 }
+    $header = 'key' + "`t" + 'service' + "`t" + 'endpoint' + "`t" + 'account' + "`t" + 'attempts' + "`t" + 'first_utc' + "`t" + 'last_utc'
+    $lines = @(Get-Content -LiteralPath $Path)
+    if (-not $lines.Count -or $lines[0] -cne $header) { throw 'Credential ledger has a foreign header.' }
+    for ($i = 1; $i -lt $lines.Count; $i++) {
+        if (-not $lines[$i]) { continue }
+        $fields = $lines[$i] -split "`t"
+        if ($fields[0] -ceq $Key -and $fields[4] -match '^[0-9]{1,6}$') { return [int]$fields[4] }
+    }
+    return 0
+}
+
+function Set-CredLedgerAttempts([string]$Path, [string]$Key, [int]$Attempts, [string]$First, [string]$Last, $Harden) {
+    $header = 'key' + "`t" + 'service' + "`t" + 'endpoint' + "`t" + 'account' + "`t" + 'attempts' + "`t" + 'first_utc' + "`t" + 'last_utc'
+    $lines = @(Get-Content -LiteralPath $Path)
+    if ($lines[0] -cne $header) { throw 'Credential ledger has a foreign header.' }
+    $seen = $false
+    $out = New-Object System.Collections.ArrayList
+    [void]$out.Add($header)
+    for ($i = 1; $i -lt $lines.Count; $i++) {
+        if (-not $lines[$i]) { continue }
+        $fields = $lines[$i] -split "`t"
+        if ($fields[0] -ceq $Key) {
+            $fields[4] = [string]$Attempts
+            $fields[6] = $Last
+            $seen = $true
+            [void]$out.Add(($fields -join "`t"))
+        } else {
+            [void]$out.Add($lines[$i])
+        }
+    }
+    if (-not $seen) {
+        [void]$out.Add(($Key, $CredService, "$CredHost`:$CredPort", (Get-CredMasked $CredAccount),
+                        [string]$Attempts, $First, $Last) -join "`t")
+    }
+    Set-Content -LiteralPath $Path -Value $out -Encoding ASCII
+    if ($Harden) { & $Harden $Path }
+}
+
+function Get-CredPolicy($AclCheck) {
+    $basis = 'unverified-single-attempt'
+    $allowed = 1
+    $digest = ''
+    if (-not $CredLockoutFile) { return @($basis, $allowed, $digest) }
+    $item = Get-Item -LiteralPath $CredLockoutFile -ErrorAction Stop
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'Lockout policy file must be a regular file and not a link.'
+    }
+    if ($AclCheck -and -not (& $AclCheck $CredLockoutFile)) {
+        throw 'Lockout policy file is readable or writable by another principal.'
+    }
+    $threshold = 0
+    foreach ($line in (Get-Content -LiteralPath $CredLockoutFile)) {
+        if ($line -match '^\s*lockout_threshold\s*=\s*([0-9]{1,3})\s*$') { $threshold = [int]$Matches[1]; break }
+    }
+    if ($threshold -lt 1) { throw 'Lockout policy file needs an integer lockout_threshold.' }
+    $digest = (Get-FileHash -LiteralPath $CredLockoutFile -Algorithm SHA256).Hash
+    if ($threshold -gt 3) { $threshold = 3 }
+    return @("operator-policy-threshold-$threshold", $threshold, $digest)
+}
+
+function Test-CredEndpointReachable([string]$HostName, [int]$Port, [int]$TimeoutMs) {
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $async = $client.BeginConnect($HostName, $Port, $null, $null)
+        if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) { return $false }
+        $client.EndConnect($async)
+        return $true
+    } catch { return $false }
+    finally { $client.Close() }
+}
+
+if ($VerifyCredential) {
+    if ($Cve -or $CveDetails -or $Poc) { throw 'Choose one CVE query or credential mode.' }
+    if (-not $CredAccount -or -not $CredEndpoint) {
+        throw 'Credential validation needs -CredAccount and -CredEndpoint.'
+    }
+    if ($CredAccount -cnotmatch '^[A-Za-z0-9._@\\-]+$' -or $CredAccount.Length -gt 256) { throw 'Invalid account name.' }
+    if ($CredEndpoint -cnotmatch '^[A-Za-z0-9._-]+(:[0-9]+)?$' -or $CredEndpoint.Length -gt 259) { throw 'Invalid endpoint.' }
+    $CredHost = $CredEndpoint
+    $CredPort = 445
+    if ($CredEndpoint -match ':([0-9]+)$') {
+        $CredHost = $CredEndpoint.Substring(0, $CredEndpoint.LastIndexOf(':'))
+        $CredPort = [int]$Matches[1]
+    }
+    if ($CredPort -lt 1 -or $CredPort -gt 65535) { throw 'Invalid endpoint port.' }
+    $CredKeySource = "$CredService|$CredAccount|$CredHost`:$CredPort"
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $credKey = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($CredKeySource))).Replace('-', '')
+    } finally { $sha.Dispose() }
+    $credNow = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $credMasked = Get-CredMasked $CredAccount
+    $credLedgerPath = Get-CredLedgerPath
+    $credLedgerDir = Split-Path -Parent $credLedgerPath
+    if (-not $credLedgerDir) { $credLedgerDir = '.' }
+    if (-not (Test-Path -LiteralPath $credLedgerDir)) {
+        New-Item -ItemType Directory -Path $credLedgerDir -Force | Out-Null
+    }
+    $ledgerHeader = 'key' + "`t" + 'service' + "`t" + 'endpoint' + "`t" + 'account' + "`t" + 'attempts' + "`t" + 'first_utc' + "`t" + 'last_utc'
+    $existing = $null
+    if (Test-Path -LiteralPath $credLedgerPath) {
+        $existing = @(Get-Content -LiteralPath $credLedgerPath)
+    }
+    if ($existing -and $existing[0] -cne $ledgerHeader) { throw 'Credential ledger has a foreign header.' }
+    if (-not $existing) { Set-Content -LiteralPath $credLedgerPath -Value $ledgerHeader -Encoding ASCII }
+    Set-PrivateFile $credLedgerPath
+    $policy = Get-CredPolicy { param($policyPath) Test-PrivateFileAcl $policyPath }
+    $policyBasis = $policy[0]
+    $policyAllowed = [int]$policy[1]
+    $policyDigest = $policy[2]
+    $credAttempts = Get-CredLedgerAttempts $credLedgerPath $credKey
+    $credFirst = $credNow
+    $credDir = Join-Path $OutputDir 'credentials'
+    if (-not (Test-Path -LiteralPath $credDir)) { New-Item -ItemType Directory -Path $credDir -Force | Out-Null }
+    Set-PrivateDirectory $credDir
+    $credRunDir = Join-Path $credDir ("$credNow-$hostName-$PID")
+    if (Test-Path -LiteralPath $credRunDir) { throw 'Credential result directory already exists.' }
+    New-Item -ItemType Directory -Path $credRunDir | Out-Null
+    Set-PrivateDirectory $credRunDir
+    $credAttemptsPath = Join-Path $credRunDir 'attempts.tsv'
+    $credAttemptsHeader = @('timestamp', 'service', 'endpoint', 'account', 'policy', 'policy_sha256', 'allowed', 'attempt', 'result') -join "`t"
+    Set-Content -LiteralPath $credAttemptsPath -Value $credAttemptsHeader -Encoding ASCII
+    Set-PrivateFile $credAttemptsPath
+    function Write-CredAttempt([int]$Attempt, [string]$Result) {
+        Add-Content -LiteralPath $credAttemptsPath -Encoding ASCII -Value (
+            @($credNow, $CredService, "$CredHost`:$CredPort", $credMasked, $policyBasis,
+              $policyDigest, [string]$policyAllowed, [string]$Attempt, $Result) -join "`t")
+    }
+    function Stop-Credential([int]$Code, [string]$Result) {
+        Write-CredAttempt ($credAttempts + 1) $Result
+        Write-Host "[SAVED] $credAttemptsPath"
+        exit $Code
+    }
+    if ($credAttempts -ge $policyAllowed) {
+        Write-Warning ("Refused {0} at {1}:{2}: {3} of {4} permitted attempts already recorded (policy {5}). No authentication was attempted." -f $credMasked, $CredHost, $CredPort, $credAttempts, $policyAllowed, $policyBasis)
+        Stop-Credential 2 'limit-reached'
+    }
+    if (-not (Test-CredEndpointReachable $CredHost $CredPort ($CredTimeoutSeconds * 1000))) {
+        Write-Warning "Cannot reach ${CredHost}:${CredPort}. No authentication was attempted."
+        Stop-Credential 3 'endpoint-unreachable'
+    }
+    $credSecret = $null
+    if ($CredSecretStdin) {
+        $credSecret = [Console]::In.ReadLine()
+    } else {
+        $secure = Read-Host -AsSecureString -Prompt ("Secret for {0} at {1}:{2}" -f $credMasked, $CredHost, $CredPort)
+        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+        try { $credSecret = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+    }
+    if ([string]::IsNullOrEmpty($credSecret) -or $credSecret.Length -gt 1024) {
+        $credSecret = $null
+        throw 'Secret missing or longer than 1024 characters.'
+    }
+    $credName = $CredAccount
+    $credDomain = $null
+    if ($CredAccount.Contains('\')) { $parts = $CredAccount.Split('\', 2); $credDomain = $parts[0]; $credName = $parts[1] }
+    elseif ($CredAccount.Contains('@')) { $parts = $CredAccount.Split('@', 2); $credDomain = $parts[1]; $credName = $parts[0] }
+    if (-not ('EdamameWnet' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class EdamameWnet
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct NETRESOURCE
+    {
+        public int dwScope;
+        public int dwType;
+        public int dwDisplayType;
+        public int dwUsage;
+        [MarshalAs(UnmanagedType.LPWStr)] public string lpLocalName;
+        [MarshalAs(UnmanagedType.LPWStr)] public string lpRemoteName;
+        [MarshalAs(UnmanagedType.LPWStr)] public string lpComment;
+        [MarshalAs(UnmanagedType.LPWStr)] public string lpProvider;
+    }
+
+    [DllImport("mpr.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "WNetAddConnection2W")]
+    public static extern int WNetAddConnection2(ref NETRESOURCE netResource, string password, string username, int flags);
+}
+'@
+    }
+    $resource = New-Object EdamameWnet+NETRESOURCE
+    $resource.dwScope = 2                                   # CONNECT_TEMPORARY
+    $resource.dwType = 1                                    # RESOURCETYPE_DISK
+    $resource.dwDisplayType = 3                             # RESOURCEDISPLAYTYPE_SHARED
+    $resource.dwUsage = 1                                   # RESOURCEUSAGE_CONNECTABLE
+    $resource.lpRemoteName = ('\\{0}\IPC$' -f $CredHost)
+    $resource.lpLocalName = $null
+    $resource.lpComment = $null
+    $resource.lpProvider = $null
+    $credUser = if ($credDomain) { "$credDomain\$credName" } else { $credName }
+    $credCode = [EdamameWnet]::WNetAddConnection2([ref]$resource, $credSecret, $credUser, 0)
+    $credSecret = $null
+    $credAttempts = $credAttempts + 1
+    Write-CredAttempt $credAttempts ([string]$credCode)
+    Set-CredLedgerAttempts $credLedgerPath $credKey $credAttempts $credFirst $credNow { Set-PrivateFile $credLedgerPath }
+    # 0 accepted, 1326 logon failure, 1331 disabled, 1327 disabled,
+    # 1909 account locked out, 53/67/1219 network or path, 85 unknown share.
+    $credResult = switch ($credCode) {
+        0 { 'accepted' }
+        1326 { 'rejected' }
+        1327 { 'rejected' }
+        1330 { 'rejected' }
+        1331 { 'rejected' }
+        1909 { 'rejected' }
+        default { 'indeterminate' }
+    }
+    if ($credResult -eq 'accepted') {
+        Write-Host ("[CRED] Accepted: {0} at {1}:{2} over {3}. Attempt {4} of {5} (policy {6})." -f $credMasked, $CredHost, $CredPort, $CredService, $credAttempts, $policyAllowed, $policyBasis)
+        Write-Host "[SAVED] $credAttemptsPath"
+        exit 0
+    }
+    if ($credResult -eq 'rejected') {
+        Write-Warning ("Rejected: {0} at {1}:{2} over {3}. Attempt {4} of {5} (policy {6})." -f $credMasked, $CredHost, $CredPort, $CredService, $credAttempts, $policyAllowed, $policyBasis)
+        Write-Host "[SAVED] $credAttemptsPath"
+        exit 1
+    }
+    Write-Warning ("Inconclusive: {0} at {1}:{2} returned {3}. Attempt {4} of {5} recorded; the authentication result is unknown." -f $credMasked, $CredHost, $CredPort, $credCode, $credAttempts, $policyAllowed)
+    Write-Host "[SAVED] $credAttemptsPath"
+    exit 3
 }
 
 @'

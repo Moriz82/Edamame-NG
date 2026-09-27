@@ -27,6 +27,32 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Edamame-NG.ps1 -Scan -
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Edamame-NG.ps1 -Resume -ApproveSystemService
 ```
 
+## Operator-supplied credential validation
+
+Credential validation is a separate, explicit operation. The operator supplies the exact account, the exact discovered endpoint, and the secret for that one check. Nothing in the tool harvests an endpoint or a secret: there is no code path that reads a secret from collector output, a cache, or the catalog, and the tool never replays a credential it found.
+
+```sh
+bash edamame-ng.sh --verify-credential --cred-account 'LAB\edatest' \
+  --cred-endpoint 192.0.2.10:445 --cred-service smb --cred-secret-stdin
+```
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Edamame-NG.ps1 -VerifyCredential `
+  -CredAccount 'LAB\edatest' -CredEndpoint 192.0.2.10:445 -CredService smb -CredSecretStdin
+```
+
+The secret arrives on standard input or from a hidden prompt. It is never a command-line argument and never an environment variable. SMB hands the secret to `smbclient` through a mode-0600 auth file in a private temporary directory that is removed before the runner returns; SSH hands it to `sshpass` on file descriptor 0 with `NumberOfPasswordPrompts=1`. The Windows runner passes it to `WNetAddConnection2` for a temporary `IPC$` connection, which is the only authentication primitive it uses.
+
+The attempt is bound to a SHA-256 of the service, account, and `host:port`, so a different account, host, port, or service is a separate budget. Without an operator lockout policy the budget is **one attempt per account and endpoint, permanently**, and a second attempt is refused before the secret is read and before any authenticator runs. `--cred-lockout-file`/`-CredLockoutFile` supplies policy evidence containing `lockout_threshold=N`; the ceiling becomes `min(N, 3)`, and the file's SHA-256 is recorded with the attempt. A policy file that is missing, a link, group- or world-writable on Windows, or lacks a usable threshold is refused.
+
+A TCP connect to the endpoint runs first. If it fails, or if the local authenticator is missing, or if an SSH host key is not already in `known_hosts`, the run records the reason and **makes no authentication attempt**, so it does not spend the budget. Host key verification is never weakened to make a check run.
+
+Exit codes: `0` accepted, `1` rejected, `2` refused with no attempt, `3` unreachable or an inconclusive result. Each run writes `credentials/<run>/attempts.tsv` in the output directory and updates `credential-ledger.tsv` in the cache directory. Records hold the masked account, the endpoint, the policy basis, the attempt number, and the result. They never hold the secret.
+
+The SMB adapter accepts `DOMAIN\user`, `user@domain`, and a bare `user`. The SSH adapter takes a local account name only; a domain-qualified name is refused rather than silently misparsed into an `OpenSSH` login.
+
+The Windows, Linux, and SMB adapters have been checked with synthetic fixtures for gating, binding, accounting, and secret handling. A real authentication attempt against a live endpoint, and an observed lockout-policy boundary, need a disposable test domain and remain unproven.
+
 Without the switch, an interactive run asks before accepting the Sysinternals EULA and creating the service. On Scan, a declined or unavailable service action leaves the Administrator-only recipe available; Resume of a saved SYSTEM recipe stops until the action is approved again. The service route requires a signed Microsoft PsExec binary from the [official PsTools download](https://learn.microsoft.com/en-us/sysinternals/downloads/psexec); `-ToolDir` accepts `PsExec64.exe` with an adjacent `.sha256` file. The runner checks Authenticode, product name, and SHA-256, and checks the saved copy again on Resume. The binary is not included in this repository.
 
 For a **disposable Windows weak-service lab only**, an elevated operator can create the fixed `EdamameWeakSvc` fixture for one existing standard-user SID:
@@ -140,12 +166,18 @@ Local synthetic checks:
 bash -n edamame-ng.sh
 shellcheck -S warning edamame-ng.sh
 python3 tests/test_linux.py
+python3 tests/test_credential_linux.py
 python3 tests/test_catalog.py
+pwsh -NoProfile -File tests/check-ps-parse.ps1
+pwsh -NoProfile -File tests/test_powershell3_compat.ps1
 pwsh -NoProfile -File tests/test_release.ps1
 pwsh -NoProfile -File tests/test_windows_catalog.ps1
 pwsh -NoProfile -File tests/test_capture_verbose.ps1
 pwsh -NoProfile -File tests/test_windows_async.ps1
+pwsh -NoProfile -File tests/test_windows_credential.ps1
 ```
+
+`tests/test_powershell3_compat.ps1` is a token and AST gate that fails on constructs a Windows PowerShell 3.0 host does not have, so a newer-engine dependency is caught here rather than on a 2012 guest. `tests/test_credential_linux.py` and `tests/test_windows_credential.ps1` use fake local authenticators and a loopback listener; they attempt no authentication against any endpoint and read no secret from an enumerator.
 
 On a disposable Windows guest, `tests/test_psexec.ps1 -ArchivePath <verified-PSTools.zip>` checks official archive extraction, Authenticode, SHA-256, verified-cache fallback, and tamper rejection without contacting the network. It requires the current official ZIP as an external fixture.
 
