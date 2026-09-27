@@ -6,7 +6,7 @@ $tokens = $null
 $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($source, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw "PowerShell parse failed: $errors" }
-foreach ($name in @('Write-CapturedTail', 'Invoke-CapturedProcess')) {
+foreach ($name in @('Write-CapturedTail', 'Ensure-EnumNative', 'Publish-EnumTerminal', 'Invoke-CapturedProcess')) {
     $fn = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
     . ([scriptblock]::Create($fn.Extent.Text))
 }
@@ -14,24 +14,33 @@ foreach ($name in @('Write-CapturedTail', 'Invoke-CapturedProcess')) {
 if ($Worker) {
     $script:ShowRawOutput = $true
     if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
-        $child = 'cmd.exe'
+        $child = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
         $arguments = '/d /c "echo started & ping -n 4 127.0.0.1 >nul & echo done"'
     } else {
         $child = '/bin/sh'
         $arguments = '-c "printf started; sleep 3; printf done"'
     }
     $output = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
+    $workerPassed = $false
+    $workerFailed = $false
     try {
         $status = Invoke-CapturedProcess $child $arguments $output 10
         if ($status -ne 'checked') { throw "capture status: $status" }
         if ((Get-Content -LiteralPath $output -Raw) -notmatch 'started.*(?s:.)*done') { throw 'raw capture incomplete' }
+        $workerPassed = $true
         'worker-verified'
+    } catch {
+        $workerFailed = $true
+        [Console]::Error.WriteLine($_.Exception.ToString())
     } finally { Remove-Item -LiteralPath $output -Force -ErrorAction SilentlyContinue }
+    if ($workerFailed -or -not $workerPassed) { exit 1 }
     exit 0
 }
 
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $testRoot | Out-Null
+$passed = $false
+$failed = $false
 try {
     $console = Join-Path $testRoot 'console.txt'
     $child = (Get-Process -Id $PID).Path
@@ -73,10 +82,15 @@ try {
     }
     if (-not $live) { throw 'raw output was not visible while the enumerator ran' }
     if ($captured -notmatch 'started.*(?s:.)*done') { throw 'console output incomplete' }
+    $passed = $true
     'Verbose captured output was visible before process completion and preserved in the raw file'
+} catch {
+    $failed = $true
+    [Console]::Error.WriteLine($_.Exception.ToString())
 } finally {
     if ($consoleStream) { $consoleStream.Dispose() }
     if ($errorStream) { $errorStream.Dispose() }
     if ($process) { $process.Dispose() }
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
+if ($failed -or -not $passed) { exit 1 }

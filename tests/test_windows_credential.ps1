@@ -17,7 +17,7 @@ $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($runner, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw "PowerShell parse failed: $($errors[0].Message)" }
 
-foreach ($name in @('Get-CredMasked', 'Test-PrivateFileAcl', 'Get-CredLedgerPath',
+foreach ($name in @('Get-FileHash', 'Get-CredMasked', 'Test-PrivateFileAcl', 'Get-CredLedgerPath',
         'Get-CredLedgerAttempts', 'Set-CredLedgerAttempts', 'Get-CredPolicy',
         'Test-CredEndpointReachable')) {
     $found = $ast.Find({

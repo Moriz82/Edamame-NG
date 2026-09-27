@@ -82,15 +82,13 @@ try {
     if ($missingDetails[1] -notmatch 'details-not-installed') { throw 'Missing detail sidecar was inferred' }
     Copy-Item -LiteralPath (Join-Path $root 'catalog/local-eop-details.tsv') -Destination (Join-Path $tampered 'local-eop-details.tsv')
     Add-Content -LiteralPath (Join-Path $tampered 'local-eop-details.tsv') -Value 'tampered'
-    $detailRejected = $false
-    try { & $source -CveDetails 'CVE-2025-32463' -CatalogDir $tampered | Out-Null }
-    catch { $detailRejected = $true }
-    if (-not $detailRejected) { throw 'Tampered CVE details were accepted' }
+    $global:LASTEXITCODE = 0
+    & $source -CveDetails 'CVE-2025-32463' -CatalogDir $tampered | Out-Null
+    if ($LASTEXITCODE -eq 0) { throw 'Tampered CVE details were accepted' }
     Set-Content -LiteralPath (Join-Path $tampered 'pocs/CVE-2025-32463/sudo-chwoot.sh') -Value 'tampered'
-    $rejected = $false
-    try { & $source -Poc 'CVE-2025-32463' -CatalogDir $tampered | Out-Null }
-    catch { $rejected = $true }
-    if (-not $rejected) { throw 'Tampered PoC was accepted' }
+    $global:LASTEXITCODE = 0
+    & $source -Poc 'CVE-2025-32463' -CatalogDir $tampered | Out-Null
+    if ($LASTEXITCODE -eq 0) { throw 'Tampered PoC was accepted' }
     $destination = Join-Path $testRoot 'cve-index.tsv'
     Write-CveIndex (Join-Path $root 'catalog') @('CVE-2021-36934', 'CVE-2025-32463', 'CVE-2023-4911', 'CVE-2099-99999') $destination
     $rows = @(Import-Csv -LiteralPath $destination -Delimiter "`t")
@@ -130,17 +128,17 @@ try {
     }
     $batch = @(Get-CveDetailsLines $complete @('CVE-2020-0001', 'CVE-2020-0002'))
     if ($batch.Count -ne 2 -or $script:detailReads -ne 1 -or $batch[0] -notmatch 'source-metadata-unreviewed') { throw 'Batch did not read exactly one touched shard' }
-    $missingRejected = $false
-    try { & $source -CveDetails 'CVE-2021-1000' -CatalogDir $complete | Out-Null } catch { $missingRejected = $true }
-    if (-not $missingRejected) { throw 'Missing installed shard accepted' }
+    $global:LASTEXITCODE = 0
+    & $source -CveDetails 'CVE-2021-1000' -CatalogDir $complete | Out-Null
+    if ($LASTEXITCODE -eq 0) { throw 'Missing installed shard accepted' }
     $touched = Join-Path $generation '2020/0.tsv.gz'
     [IO.File]::WriteAllBytes($touched, [byte[]]@(31, 139, 8))
     $badBatch = @(Get-CveDetailsLines $complete @('CVE-2020-0001', 'CVE-2020-01000'))
     if ($badBatch.Count -ne 2 -or @($badBatch | Where-Object { $_ -match 'integrity-failed' }).Count -ne 1 -or
         @($badBatch | Where-Object { $_ -match 'source-metadata-unreviewed' }).Count -ne 1) { throw 'Batch did not isolate a corrupt shard' }
-    $corruptRejected = $false
-    try { & $source -CveDetails 'CVE-2020-0001' -CatalogDir $complete | Out-Null } catch { $corruptRejected = $true }
-    if (-not $corruptRejected) { throw 'Corrupt installed shard accepted' }
+    $global:LASTEXITCODE = 0
+    & $source -CveDetails 'CVE-2020-0001' -CatalogDir $complete | Out-Null
+    if ($LASTEXITCODE -eq 0) { throw 'Corrupt installed shard accepted' }
     Remove-Item -LiteralPath (Join-Path $complete 'all-cve-details/installed')
     $absent = @(& $source -CveDetails 'CVE-2020-0001' -CatalogDir $complete)
     if ($absent[1] -notmatch 'details-not-installed') { throw 'Source-clone sidecar fallback failed' }

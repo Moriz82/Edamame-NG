@@ -29,6 +29,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+trap {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}
 if ([string]::IsNullOrWhiteSpace($CatalogDir)) { $CatalogDir = Join-Path $PSScriptRoot 'catalog' }
 $hostName = $env:COMPUTERNAME
 $localBase = $env:LOCALAPPDATA
@@ -771,135 +775,578 @@ function Write-CapturedTail([string[]]$Paths, [long[]]$Offsets, [Text.Decoder[]]
     [Console]::Out.Flush()
 }
 
-function Invoke-CapturedProcess([string]$FilePath, [string]$Arguments, [string]$OutputPath, [int]$TimeoutSeconds) {
+function Ensure-EnumNative {
+    if ('EdamameEnumNative' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public sealed class EdamameEnumProcess {
+    internal IntPtr JobHandle;
+    internal IntPtr ProcessHandle;
+    internal EdamameEnumProcess(IntPtr job, IntPtr process) {
+        JobHandle = job;
+        ProcessHandle = process;
+    }
+    public bool HasExited() {
+        uint wait = EdamameEnumNative.WaitForSingleObject(ProcessHandle, 0);
+        if (wait == EdamameEnumNative.WAIT_OBJECT_0) return true;
+        if (wait == EdamameEnumNative.WAIT_TIMEOUT) return false;
+        throw new Win32Exception(Marshal.GetLastWin32Error(), "WaitForSingleObject failed.");
+    }
+    public int ExitCode() {
+        uint code;
+        if (!EdamameEnumNative.GetExitCodeProcess(ProcessHandle, out code)) {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "GetExitCodeProcess failed.");
+        }
+        return unchecked((int)code);
+    }
+    public int ActiveProcesses() {
+        return EdamameEnumNative.GetActiveProcesses(JobHandle);
+    }
+    public void Terminate() {
+        if (JobHandle != IntPtr.Zero && !EdamameEnumNative.TerminateJobObject(JobHandle, 1)) {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "TerminateJobObject failed.");
+        }
+    }
+    public void Close() {
+        if (ProcessHandle != IntPtr.Zero) {
+            EdamameEnumNative.CloseHandle(ProcessHandle);
+            ProcessHandle = IntPtr.Zero;
+        }
+        if (JobHandle != IntPtr.Zero) {
+            EdamameEnumNative.CloseHandle(JobHandle);
+            JobHandle = IntPtr.Zero;
+        }
+    }
+}
+
+public static class EdamameEnumNative {
+    internal const uint WAIT_OBJECT_0 = 0;
+    internal const uint WAIT_TIMEOUT = 258;
+    private const uint CREATE_SUSPENDED = 0x00000004;
+    private const uint CREATE_NO_WINDOW = 0x08000000;
+    private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+    private const uint STARTF_USESTDHANDLES = 0x00000100;
+    private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+    private const int JobObjectExtendedLimitInformation = 9;
+    private const uint GENERIC_READ = 0x80000000;
+    private const uint GENERIC_WRITE = 0x40000000;
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint FILE_SHARE_WRITE = 0x00000002;
+    private const uint FILE_SHARE_DELETE = 0x00000004;
+    private const uint CREATE_ALWAYS = 2;
+    private const uint OPEN_EXISTING = 3;
+    private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+    private const uint PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002;
+    private const int ERROR_INSUFFICIENT_BUFFER = 122;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SECURITY_ATTRIBUTES {
+        public int Length;
+        public IntPtr SecurityDescriptor;
+        public int InheritHandle;
+    }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct STARTUPINFO {
+        public int cb;
+        public IntPtr Reserved;
+        public IntPtr Desktop;
+        public IntPtr Title;
+        public int X;
+        public int Y;
+        public int XSize;
+        public int YSize;
+        public int XCountChars;
+        public int YCountChars;
+        public int FillAttribute;
+        public uint Flags;
+        public short ShowWindow;
+        public short Reserved2;
+        public IntPtr Reserved2Ptr;
+        public IntPtr StdInput;
+        public IntPtr StdOutput;
+        public IntPtr StdError;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct STARTUPINFOEX {
+        public STARTUPINFO StartupInfo;
+        public IntPtr AttributeList;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_INFORMATION {
+        public IntPtr Process;
+        public IntPtr Thread;
+        public uint ProcessId;
+        public uint ThreadId;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_ACCOUNTING_INFORMATION {
+        public long TotalUserTime;
+        public long TotalKernelTime;
+        public long ThisPeriodTotalUserTime;
+        public long ThisPeriodTotalKernelTime;
+        public uint TotalPageFaultCount;
+        public uint TotalProcesses;
+        public uint ActiveProcesses;
+        public uint TotalTerminatedProcesses;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_THREAD_ATTRIBUTE_LIST {
+        public IntPtr Reserved;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateJobObjectW(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateFileW(string name, uint access, uint share, ref SECURITY_ATTRIBUTES security,
+        uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CreateProcessW(string applicationName, StringBuilder commandLine, IntPtr processAttributes,
+        IntPtr threadAttributes, bool inheritHandles, uint creationFlags, IntPtr environment, string currentDirectory,
+        ref STARTUPINFOEX startupInfo, out PROCESS_INFORMATION processInformation);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool InitializeProcThreadAttributeList(IntPtr attributeList, int count, int flags, ref IntPtr size);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool UpdateProcThreadAttribute(IntPtr attributeList, uint flags, IntPtr attribute, IntPtr value,
+        IntPtr size, IntPtr previous, IntPtr returnSize);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint ResumeThread(IntPtr thread);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    internal static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    internal static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length,
+        IntPtr returnLength);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    internal static extern bool TerminateJobObject(IntPtr job, uint code);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    internal static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateProcess(IntPtr process, uint code);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool DeleteProcThreadAttributeList(IntPtr attributeList);
+
+    private static void ThrowLastError(string operation) {
+        throw new Win32Exception(Marshal.GetLastWin32Error(), operation + " failed.");
+    }
+    private static bool IsInvalidHandle(IntPtr handle) {
+        return handle == IntPtr.Zero || handle == new IntPtr(-1);
+    }
+    private static string Quote(string value) {
+        return "\"" + value.Replace("\"", "\\\"") + "\"";
+    }
+
+    public static EdamameEnumProcess Launch(string filePath, string arguments, string stdoutPath, string stderrPath) {
+        IntPtr job = IntPtr.Zero;
+        IntPtr stdin = IntPtr.Zero;
+        IntPtr stdout = IntPtr.Zero;
+        IntPtr stderr = IntPtr.Zero;
+        IntPtr attributes = IntPtr.Zero;
+        IntPtr process = IntPtr.Zero;
+        IntPtr thread = IntPtr.Zero;
+        GCHandle handles = new GCHandle();
+        bool handlesPinned = false;
+        try {
+            job = CreateJobObjectW(IntPtr.Zero, null);
+            if (IsInvalidHandle(job)) ThrowLastError("CreateJobObjectW");
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            IntPtr limitsPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION)));
+            try {
+                Marshal.StructureToPtr(limits, limitsPtr, false);
+                if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, limitsPtr,
+                    (uint)Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION)))) ThrowLastError("SetInformationJobObject");
+            } finally { Marshal.FreeHGlobal(limitsPtr); }
+
+            SECURITY_ATTRIBUTES security = new SECURITY_ATTRIBUTES();
+            security.Length = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
+            security.InheritHandle = 1;
+            stdin = CreateFileW("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ref security, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
+            if (IsInvalidHandle(stdin)) ThrowLastError("CreateFileW stdin");
+            stdout = CreateFileW(stdoutPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ref security, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
+            if (IsInvalidHandle(stdout)) ThrowLastError("CreateFileW stdout");
+            stderr = CreateFileW(stderrPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ref security, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
+            if (IsInvalidHandle(stderr)) ThrowLastError("CreateFileW stderr");
+
+            IntPtr attributeSize = IntPtr.Zero;
+            InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref attributeSize);
+            if (attributeSize == IntPtr.Zero) ThrowLastError("InitializeProcThreadAttributeList size");
+            attributes = Marshal.AllocHGlobal(attributeSize.ToInt32());
+            if (!InitializeProcThreadAttributeList(attributes, 1, 0, ref attributeSize)) ThrowLastError("InitializeProcThreadAttributeList");
+            IntPtr[] inherited = new IntPtr[] { stdin, stdout, stderr };
+            handles = GCHandle.Alloc(inherited, GCHandleType.Pinned);
+            handlesPinned = true;
+            IntPtr handleList = handles.AddrOfPinnedObject();
+            if (!UpdateProcThreadAttribute(attributes, 0, new IntPtr(PROC_THREAD_ATTRIBUTE_HANDLE_LIST), handleList,
+                new IntPtr(IntPtr.Size * inherited.Length), IntPtr.Zero, IntPtr.Zero)) ThrowLastError("UpdateProcThreadAttribute");
+
+            STARTUPINFOEX startup = new STARTUPINFOEX();
+            startup.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
+            startup.StartupInfo.Flags = STARTF_USESTDHANDLES;
+            startup.StartupInfo.StdInput = stdin;
+            startup.StartupInfo.StdOutput = stdout;
+            startup.StartupInfo.StdError = stderr;
+            startup.AttributeList = attributes;
+            StringBuilder commandLine = new StringBuilder(Quote(filePath) + (String.IsNullOrEmpty(arguments) ? "" : " " + arguments));
+            PROCESS_INFORMATION info;
+            if (!CreateProcessW(filePath, commandLine, IntPtr.Zero, IntPtr.Zero, true,
+                CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, IntPtr.Zero, null,
+                ref startup, out info)) ThrowLastError("CreateProcessW");
+            process = info.Process;
+            thread = info.Thread;
+            if (!AssignProcessToJobObject(job, process)) ThrowLastError("AssignProcessToJobObject");
+            if (ResumeThread(thread) == 0xffffffff) ThrowLastError("ResumeThread");
+            CloseHandle(thread);
+            thread = IntPtr.Zero;
+            CloseHandle(stdin);
+            stdin = IntPtr.Zero;
+            CloseHandle(stdout);
+            stdout = IntPtr.Zero;
+            CloseHandle(stderr);
+            stderr = IntPtr.Zero;
+            if (handlesPinned) { handles.Free(); handlesPinned = false; }
+            if (attributes != IntPtr.Zero) { DeleteProcThreadAttributeList(attributes); Marshal.FreeHGlobal(attributes); attributes = IntPtr.Zero; }
+            EdamameEnumProcess result = new EdamameEnumProcess(job, process);
+            job = IntPtr.Zero;
+            process = IntPtr.Zero;
+            return result;
+        } catch {
+            if (process != IntPtr.Zero) {
+                TerminateProcess(process, 1);
+                CloseHandle(process);
+            }
+            if (thread != IntPtr.Zero) CloseHandle(thread);
+            if (stdin != IntPtr.Zero) CloseHandle(stdin);
+            if (stdout != IntPtr.Zero) CloseHandle(stdout);
+            if (stderr != IntPtr.Zero) CloseHandle(stderr);
+            if (handlesPinned) handles.Free();
+            if (attributes != IntPtr.Zero) { DeleteProcThreadAttributeList(attributes); Marshal.FreeHGlobal(attributes); }
+            if (job != IntPtr.Zero) CloseHandle(job);
+            throw;
+        }
+    }
+
+    internal static int GetActiveProcesses(IntPtr job) {
+        int size = Marshal.SizeOf(typeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION));
+        IntPtr buffer = Marshal.AllocHGlobal(size);
+        try {
+            if (!QueryInformationJobObject(job, 1, buffer, (uint)size, IntPtr.Zero)) return -1;
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info = (JOBOBJECT_BASIC_ACCOUNTING_INFORMATION)Marshal.PtrToStructure(buffer,
+                typeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION));
+            return unchecked((int)info.ActiveProcesses);
+        } finally { Marshal.FreeHGlobal(buffer); }
+    }
+}
+'@ -Language CSharp -ErrorAction Stop
+}
+
+function Clear-EnumCaptureState([string]$OutputPath) {
+    $suffix = '.stale.' + [Guid]::NewGuid().ToString('N')
+    $paths = @(
+        $OutputPath, "$OutputPath.stdout", "$OutputPath.stderr", "$OutputPath.pending",
+        "$OutputPath.cancel", "$OutputPath.terminal.json", "$OutputPath.terminal.json.pending"
+    )
+    foreach ($path in $paths) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        $destination = "$path$suffix"
+        Move-Item -LiteralPath $path -Destination $destination -ErrorAction Stop
+    }
+}
+
+function Publish-EnumTerminal([string]$Path, [string]$Status, [int]$ExitCode, [string]$LaunchId) {
+    $allowed = @('checked', 'partial', 'timeout', 'partial-after-proof', 'cleanup-failed')
+    if ($Status -notin $allowed) { throw "Invalid enumerator terminal status: $Status" }
+    if ($LaunchId -notmatch '^[0-9a-f]{32}$') { throw 'Invalid enumerator launch ID.' }
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        try {
+            $existing = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+            if ($existing.version -eq 1 -and $existing.status -in $allowed -and
+                [string]$existing.exit_code -match '^-?[0-9]+$' -and $existing.launch_id -ceq $LaunchId) { return }
+        } catch { }
+        throw 'Enumerator terminal marker already exists and is invalid.'
+    }
+    $pending = "$Path.pending"
+    $record = [pscustomobject]@{
+        version = 1
+        launch_id = $LaunchId
+        status = $Status
+        exit_code = $ExitCode
+        published_utc = (Get-Date).ToUniversalTime().ToString('o')
+    }
+    $record | ConvertTo-Json -Compress | Set-Content -LiteralPath $pending -Encoding ASCII
+    try {
+        [IO.File]::Move($pending, $Path)
+    } catch {
+        Remove-Item -LiteralPath $pending -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw }
+    }
+}
+
+function Read-EnumTerminal($Entry) {
+    if (-not (Test-Path -LiteralPath $Entry.Terminal -PathType Leaf)) { return $null }
+    try {
+        $marker = Get-Content -LiteralPath $Entry.Terminal -Raw | ConvertFrom-Json
+        if ($marker.version -ne 1 -or $marker.launch_id -cne $Entry.LaunchId -or
+            $marker.status -notin @('checked', 'partial', 'timeout', 'partial-after-proof', 'cleanup-failed')) { return $null }
+        if ([string]$marker.exit_code -notmatch '^-?[0-9]+$') { return $null }
+        return $marker
+    } catch { return $null }
+}
+
+function Invoke-CapturedProcess([string]$FilePath, [string]$Arguments, [string]$OutputPath, [int]$TimeoutSeconds, [string]$LaunchId) {
     $stdout = "$OutputPath.stdout"
     $stderr = "$OutputPath.stderr"
-    $start = New-Object Diagnostics.ProcessStartInfo
-    $start.FileName = $FilePath
-    $start.Arguments = $Arguments
-    $start.UseShellExecute = $false
-    $start.CreateNoWindow = $true
-    $start.RedirectStandardOutput = $true
-    $start.RedirectStandardError = $true
-    $process = New-Object Diagnostics.Process
-    $process.StartInfo = $start
+    $cancelPath = "$OutputPath.cancel"
+    $terminalPath = "$OutputPath.terminal.json"
+    if (-not $LaunchId) { $LaunchId = [Guid]::NewGuid().ToString('N') }
+    $windows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+    $native = $null
+    $process = $null
+    $processStarted = $false
     $stdoutStream = $null
     $stderrStream = $null
-    $started = $false
+    $stdoutTask = $null
+    $stderrTask = $null
+    $finished = $false
+    $timedOut = $false
+    $cancelled = $false
+    $cleanup = $false
+    $exitCode = -1
+    $errorText = $null
+    $paths = @($stdout, $stderr)
+    $offsets = [long[]]@(0, 0)
+    $decoders = $null
     try {
-        $stdoutStream = New-Object IO.FileStream -ArgumentList @($stdout, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite, 1)
-        $stderrStream = New-Object IO.FileStream -ArgumentList @($stderr, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite, 1)
-        [void]$process.Start()
-        $started = $true
-        $stdoutTask = $process.StandardOutput.BaseStream.CopyToAsync($stdoutStream)
-        $stderrTask = $process.StandardError.BaseStream.CopyToAsync($stderrStream)
-        Set-Content -LiteralPath "$OutputPath.pid" -Value $process.Id -Encoding ASCII
+        if ($windows) {
+            if (-not [IO.Path]::IsPathRooted($FilePath)) { throw 'Enumerator executable path must be absolute.' }
+            Ensure-EnumNative
+            $native = [EdamameEnumNative]::Launch($FilePath, $Arguments, $stdout, $stderr)
+        } else {
+            $start = New-Object Diagnostics.ProcessStartInfo
+            $start.FileName = $FilePath
+            $start.Arguments = $Arguments
+            $start.UseShellExecute = $false
+            $start.CreateNoWindow = $true
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            $process = New-Object Diagnostics.Process
+            $process.StartInfo = $start
+            $stdoutStream = New-Object IO.FileStream -ArgumentList @($stdout, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite, 1)
+            $stderrStream = New-Object IO.FileStream -ArgumentList @($stderr, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite, 1)
+            [void]$process.Start()
+            $processStarted = $true
+            $stdoutTask = $process.StandardOutput.BaseStream.CopyToAsync($stdoutStream)
+            $stderrTask = $process.StandardError.BaseStream.CopyToAsync($stderrStream)
+        }
         if ($script:ShowRawOutput) {
-            $paths = @($stdout, $stderr)
-            $offsets = [long[]]@(0, 0)
             $encoding = [Console]::OutputEncoding
             $decoders = [Text.Decoder[]]@($encoding.GetDecoder(), $encoding.GetDecoder())
-            $watch = [Diagnostics.Stopwatch]::StartNew()
-            do {
-                $remaining = $TimeoutSeconds * 1000 - [int]$watch.ElapsedMilliseconds
-                $finished = $process.WaitForExit([Math]::Min(200, [Math]::Max(1, $remaining)))
+        }
+        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+        while ($true) {
+            if (Test-Path -LiteralPath $cancelPath -PathType Leaf) { $cancelled = $true; break }
+            if ($windows) {
+                $rootExited = $native.HasExited()
+                $active = $native.ActiveProcesses()
+                if ($active -lt 0) { throw 'Could not query the enumerator Job Object.' }
+                if ($rootExited -and $active -eq 0) { $finished = $true; break }
+            } else {
+                $finished = $process.HasExited
+                if ($finished) { break }
+            }
+            if ([DateTime]::UtcNow -ge $deadline) { $timedOut = $true; break }
+            if ($script:ShowRawOutput) {
                 Write-CapturedTail $paths $offsets $decoders
-            } while (-not $finished -and $watch.ElapsedMilliseconds -lt $TimeoutSeconds * 1000)
-        } else {
-            $finished = $process.WaitForExit($TimeoutSeconds * 1000)
+            }
+            Start-Sleep -Milliseconds 100
         }
         if (-not $finished) {
-            try { & taskkill.exe /PID $process.Id /T /F *> $null } catch { }
-            if (-not $process.HasExited) { $process.Kill() }
-            [void]$process.WaitForExit(5000)
-            Write-Warning "$([IO.Path]::GetFileName($FilePath)) exceeded $TimeoutSeconds seconds; preserving partial output."
-        }
-        if (-not $stdoutTask.Wait(5000) -or -not $stderrTask.Wait(5000)) {
-            throw 'Capture streams did not finish after the process exited.'
-        }
-        if ($script:ShowRawOutput) { Write-CapturedTail $paths $offsets $decoders }
-        $exitCode = if ($finished) { $process.ExitCode } else { -1 }
-    } finally {
-        if ($started -and -not $process.HasExited) { try { $process.Kill() } catch { } }
-        if ($stdoutStream) { $stdoutStream.Dispose() }
-        if ($stderrStream) { $stderrStream.Dispose() }
-        $process.Dispose()
-        Remove-Item -LiteralPath "$OutputPath.pid" -Force -ErrorAction SilentlyContinue
-    }
-    $destination = [IO.File]::Create($OutputPath)
-    try {
-        foreach ($part in @($stdout, $stderr)) {
-            if (Test-Path -LiteralPath $part) {
-                $source = [IO.File]::OpenRead($part)
-                try { $source.CopyTo($destination) } finally { $source.Dispose() }
+            if ($windows) {
+                $native.Terminate()
+                $graceDeadline = [DateTime]::UtcNow.AddSeconds(5)
+                do {
+                    $active = $native.ActiveProcesses()
+                    if ($active -eq 0) { break }
+                    if ([DateTime]::UtcNow -ge $graceDeadline) { throw 'Enumerator Job Object did not close its process tree.' }
+                    Start-Sleep -Milliseconds 100
+                } while ($true)
+            } else {
+                if (-not $process.HasExited) { $process.Kill() }
+                [void]$process.WaitForExit(5000)
+                if (-not $process.HasExited) { throw 'Enumerator process did not exit after termination.' }
             }
         }
-    } finally { $destination.Dispose() }
-    Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
-    if (-not $finished) { return 'timeout' }
-    if ($exitCode -ne 0) { return 'partial' }
-    return 'checked'
-}
-
-function Start-EnumJob([string]$Name, [string]$FilePath, [string]$Arguments, [string]$OutputPath) {
-    $definition = ${function:Invoke-CapturedProcess}.ToString()
-    $job = Start-Job -ScriptBlock {
-        param($command, $arguments, $path, $limit, $source)
-        . ([scriptblock]::Create("function Invoke-CapturedProcess { $source }"))
-        $script:ShowRawOutput = $false
-        Invoke-CapturedProcess $command $arguments $path $limit
-    } -ArgumentList $FilePath, $Arguments, $OutputPath, $ToolTimeoutSeconds, $definition
-    return @{ Name = $Name; Job = $job; Output = $OutputPath; Offset = [long]0; Stopped = $false }
-}
-
-function Stop-EnumJob($Entry) {
-    $pidPath = "$($Entry.Output).pid"
-    for ($i = 0; $i -lt 20 -and -not (Test-Path -LiteralPath $pidPath) -and
-        $Entry.Job.State -in @('NotStarted', 'Running'); $i++) {
-        Start-Sleep -Milliseconds 100
-    }
-    if (Test-Path -LiteralPath $pidPath) {
-        $childPid = Get-Content -LiteralPath $pidPath -TotalCount 1
-        if ($childPid -match '^[0-9]+$') {
-            try {
-                if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
-                    & taskkill.exe /PID $childPid /T /F *> $null
-                } else { Stop-Process -Id ([int]$childPid) -Force }
-            } catch { }
+        if ($windows) {
+            $exitCode = $native.ExitCode()
+            $native.Close()
+            $native = $null
+        } else {
+            if (-not $stdoutTask.Wait(5000) -or -not $stderrTask.Wait(5000)) {
+                throw 'Capture streams did not finish after the process exited.'
+            }
+            $exitCode = if ($finished) { $process.ExitCode } else { -1 }
         }
-    } else { Stop-Job -Job $Entry.Job -ErrorAction SilentlyContinue }
-    $Entry.Stopped = $true
-}
-
-function Complete-EnumJob($Entry) {
-    [void](Wait-Job -Job $Entry.Job -Timeout ($ToolTimeoutSeconds + 10))
-    if ($Entry.Job.State -notin @('Completed', 'Failed', 'Stopped')) {
-        Stop-EnumJob $Entry
-        Stop-Job -Job $Entry.Job -ErrorAction SilentlyContinue
+        if ($script:ShowRawOutput) { Write-CapturedTail $paths $offsets $decoders }
+        $cleanup = $true
+    } catch {
+        $errorText = $_.Exception.Message
+    } finally {
+        if ($native) {
+            try { $native.Terminate() } catch { }
+            try { $native.Close() } catch { }
+        }
+        if ($process -and $processStarted -and -not $process.HasExited) { try { $process.Kill() } catch { } }
+        if ($stdoutStream) { $stdoutStream.Dispose() }
+        if ($stderrStream) { $stderrStream.Dispose() }
+        if ($process) { $process.Dispose() }
     }
-    if ($Entry.Job.State -eq 'Failed' -and (Test-Path -LiteralPath "$($Entry.Output).pid")) {
-        Stop-EnumJob $Entry
-        $Entry.Stopped = $false
+    if (-not $cleanup) {
+        Remove-Item -LiteralPath "$OutputPath.pending", $OutputPath -Force -ErrorAction SilentlyContinue
+        try { Publish-EnumTerminal $terminalPath 'cleanup-failed' -1 $LaunchId } catch { }
+        if ($errorText) { Write-Warning "$([IO.Path]::GetFileName($FilePath)) capture failed: $errorText" }
+        return 'cleanup-failed'
     }
-    $result = @(Receive-Job -Job $Entry.Job -ErrorAction SilentlyContinue)
-    Remove-Job -Job $Entry.Job -Force -ErrorAction SilentlyContinue
-    if (-not (Test-Path -LiteralPath $Entry.Output)) {
-        $parts = @(@("$($Entry.Output).stdout", "$($Entry.Output).stderr") |
-            Where-Object { Test-Path -LiteralPath $_ })
-        if ($parts.Count -gt 0) {
-            $destination = [IO.File]::Create($Entry.Output)
-            try {
-                foreach ($part in $parts) {
+    $status = if ($cancelled) { 'partial-after-proof' }
+        elseif ($timedOut) { 'timeout' }
+        elseif ($exitCode -ne 0) { 'partial' }
+        else { 'checked' }
+    $pending = "$OutputPath.pending"
+    try {
+        $destination = [IO.File]::Create($pending)
+        try {
+            foreach ($part in @($stdout, $stderr)) {
+                if (Test-Path -LiteralPath $part) {
                     $source = [IO.File]::OpenRead($part)
                     try { $source.CopyTo($destination) } finally { $source.Dispose() }
                 }
-            } finally { $destination.Dispose() }
-            Remove-Item -LiteralPath $parts -Force -ErrorAction SilentlyContinue
+            }
+        } finally { $destination.Dispose() }
+        [IO.File]::Move($pending, $OutputPath)
+        Publish-EnumTerminal $terminalPath $status $exitCode $LaunchId
+        Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
+    } catch {
+        Remove-Item -LiteralPath $pending, $OutputPath -Force -ErrorAction SilentlyContinue
+        try { Publish-EnumTerminal $terminalPath 'cleanup-failed' -1 $LaunchId } catch { }
+        Write-Warning "$([IO.Path]::GetFileName($FilePath)) capture merge failed: $($_.Exception.Message)"
+        return 'cleanup-failed'
+    }
+    if ($timedOut) {
+        Write-Warning "$([IO.Path]::GetFileName($FilePath)) exceeded $TimeoutSeconds seconds; preserving partial output."
+    }
+    return $status
+}
+
+function Start-EnumJob([string]$Name, [string]$FilePath, [string]$Arguments, [string]$OutputPath) {
+    Clear-EnumCaptureState $OutputPath
+    $launchId = [Guid]::NewGuid().ToString('N')
+    $definition = ${function:Invoke-CapturedProcess}.ToString()
+    $nativeDefinition = ${function:Ensure-EnumNative}.ToString()
+    $terminalDefinition = ${function:Publish-EnumTerminal}.ToString()
+    $job = Start-Job -ScriptBlock {
+        param($command, $arguments, $path, $limit, $launch, $source, $nativeSource, $terminalSource)
+        . ([scriptblock]::Create("function Ensure-EnumNative { $nativeSource }"))
+        . ([scriptblock]::Create("function Publish-EnumTerminal { $terminalSource }"))
+        . ([scriptblock]::Create("function Invoke-CapturedProcess { $source }"))
+        $script:ShowRawOutput = $false
+        Invoke-CapturedProcess $command $arguments $path $limit $launch
+    } -ArgumentList $FilePath, $Arguments, $OutputPath, $ToolTimeoutSeconds, $launchId, $definition, $nativeDefinition, $terminalDefinition
+    return @{
+        Name = $Name
+        Job = $job
+        Output = $OutputPath
+        Cancel = "$OutputPath.cancel"
+        Terminal = "$OutputPath.terminal.json"
+        LaunchId = $launchId
+        Deadline = [DateTime]::UtcNow.AddSeconds($ToolTimeoutSeconds)
+        GraceSeconds = 5
+        Offset = [long]0
+        Stopped = $false
+        Status = $null
+    }
+}
+
+function Stop-EnumJob($Entry) {
+    if (Read-EnumTerminal $Entry) { return }
+    if (-not (Test-Path -LiteralPath $Entry.Cancel -PathType Leaf)) {
+        try { Set-Content -LiteralPath $Entry.Cancel -Value 'cancel' -Encoding ASCII }
+        catch { if (-not (Test-Path -LiteralPath $Entry.Cancel -PathType Leaf)) { throw } }
+    }
+    if (Read-EnumTerminal $Entry) { return }
+    $Entry.Stopped = $true
+    $Entry.Status = 'cancel-requested'
+}
+
+function Complete-EnumJob($Entry) {
+    $limit = $Entry.Deadline.AddSeconds([int]$Entry.GraceSeconds)
+    while (-not (Read-EnumTerminal $Entry) -and [DateTime]::UtcNow -lt $limit) {
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not (Read-EnumTerminal $Entry)) {
+        Stop-EnumJob $Entry
+        while (-not (Read-EnumTerminal $Entry) -and [DateTime]::UtcNow -lt $limit) {
+            Start-Sleep -Milliseconds 100
         }
     }
-    if ($Entry.Stopped) { return 'partial-after-proof' }
-    if ($result.Count -eq 0) { return 'partial' }
-    return [string]$result[-1]
+    if (-not (Read-EnumTerminal $Entry)) {
+        Stop-Job -Job $Entry.Job -ErrorAction SilentlyContinue
+    }
+    $marker = Read-EnumTerminal $Entry
+    if ($marker) {
+        $Entry.Status = [string]$marker.status
+        Receive-Job -Job $Entry.Job -ErrorAction SilentlyContinue | Out-Null
+        Remove-Job -Job $Entry.Job -Force -ErrorAction SilentlyContinue
+        if ($Entry.Status -eq 'cleanup-failed') {
+            Remove-Item -LiteralPath $Entry.Output, "$($Entry.Output).pending" -Force -ErrorAction SilentlyContinue
+        } elseif (-not (Test-Path -LiteralPath $Entry.Output -PathType Leaf)) {
+            $Entry.Status = 'cleanup-failed'
+        }
+    } else {
+        $Entry.Status = 'cleanup-failed'
+        Remove-Item -LiteralPath $Entry.Output, "$($Entry.Output).pending" -Force -ErrorAction SilentlyContinue
+        Remove-Job -Job $Entry.Job -Force -ErrorAction SilentlyContinue
+    }
+    return $Entry.Status
 }
 
 function Watch-EnumOutput($Entry, [hashtable]$SeenCves) {
@@ -1548,7 +1995,7 @@ if ($havePrivescCheck) {
         $quotedCheck = $privescCheck.Replace("'", "''")
         $checkCode = ". '$quotedCheck'; Invoke-PrivescCheck -Extended -Audit"
         $encodedCheck = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($checkCode))
-        $privescJob = Start-EnumJob 'privesccheck' 'powershell.exe' "/NoProfile /ExecutionPolicy Bypass /EncodedCommand $encodedCheck" `
+        $privescJob = Start-EnumJob 'privesccheck' (Get-TrustedPowerShell) "/NoProfile /ExecutionPolicy Bypass /EncodedCommand $encodedCheck" `
             (Join-Path $capture 'privesccheck-output.txt')
         $enumJobs += $privescJob
     } catch {
@@ -1559,6 +2006,9 @@ if ($havePrivescCheck) {
 
 # Native prerequisites are independent of enumerator prose, so test them as
 # soon as the background collectors start. Enumerator CVEs remain review-only.
+$enumLifecycleComplete = $false
+$enumCleanupFailed = $false
+try {
 $fastRecipe = $null
 $fastAttemptedRecipe = $null
 $fastSuccessRecipe = $null
@@ -1570,8 +2020,12 @@ elseif ($EnableWeakServiceLab -and (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Edama
     $weakLabState = Get-WeakServiceLabState
     if ($weakLabState) { $fastRecipe = 'weak-service-lab' }
 }
+if ($fastRecipe -eq 'weak-service-lab' -and $enumJobs.Count -gt 0) {
+    Write-Host '[RECIPE] Waiting for collectors before the named-pipe service proof.'
+    $fastRecipe = $null
+}
 if ($fastRecipe) {
-    Write-Finding 'local-elevation' "$fastRecipe independently verified while enumeration runs"
+    Write-Finding 'local-elevation' "$fastRecipe prerequisites independently verified while enumeration runs"
     if ($fastRecipe -eq 'weak-service-lab') {
         if (-not (Confirm-WeakServiceChange)) {
             Write-Attempt $fastRecipe 'service-change-approval-declined'
@@ -1604,7 +2058,14 @@ if ($fastRecipe) {
 }
 
 $lastLiveCount = 0
-while (@($enumJobs | Where-Object { $_.Job.State -in @('NotStarted', 'Running') }).Count -gt 0) {
+$watchDeadline = [DateTime]::UtcNow
+foreach ($entry in $enumJobs) {
+    if ($entry.Deadline.AddSeconds([int]$entry.GraceSeconds) -gt $watchDeadline) {
+        $watchDeadline = $entry.Deadline.AddSeconds([int]$entry.GraceSeconds)
+    }
+}
+while (@($enumJobs | Where-Object { $_.Job.State -in @('NotStarted', 'Running') }).Count -gt 0 -and
+    [DateTime]::UtcNow -lt $watchDeadline) {
     foreach ($entry in $enumJobs) { Watch-EnumOutput $entry $liveCves }
     if ($liveCves.Count -gt $lastLiveCount) {
         Write-Finding 'cve-candidates' "$($liveCves.Count) suggested so far; review exact build and patch status"
@@ -1612,29 +2073,38 @@ while (@($enumJobs | Where-Object { $_.Job.State -in @('NotStarted', 'Running') 
     }
     Start-Sleep -Milliseconds 250
 }
+foreach ($entry in @($enumJobs | Where-Object { $_.Job.State -in @('NotStarted', 'Running') })) {
+    Stop-EnumJob $entry
+}
 foreach ($entry in $enumJobs) { Watch-EnumOutput $entry $liveCves }
 
 $sharpStatus = if ($sharpJob) { Complete-EnumJob $sharpJob } else { 'unavailable' }
 if ($sharpJob) {
     $sharpCollectedZip = Get-ChildItem -LiteralPath $sharpOut -Filter '*sharphound.zip' -File -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    $zipStatus = if (-not $sharpCollectedZip) { 'partial-no-zip' }
+    $zipStatus = if ($sharpStatus -eq 'cleanup-failed') { 'cleanup-failed' }
+        elseif (-not $sharpCollectedZip) { 'partial-no-zip' }
         elseif ($sharpStatus -eq 'checked') { 'checked' } else { 'partial-zip' }
+    if ($sharpStatus -ne 'checked') { $sharpCollectedZip = $null }
     Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "sharphound`t$zipStatus"
 }
 $winpeasStatus = if ($winpeasJob) { Complete-EnumJob $winpeasJob } else { 'unavailable' }
 $winpeasOk = $winpeasStatus -eq 'checked'
 if ($winpeasJob) { Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "winpeas`t$winpeasStatus" }
-if (-not $winpeasOk -and $haveBat -and (-not $fastSuccessRecipe -or $NoShell -or $FinishBgEnum)) {
+if (-not $winpeasOk -and $winpeasStatus -ne 'cleanup-failed' -and $haveBat -and (-not $fastSuccessRecipe -or $NoShell -or $FinishBgEnum)) {
     Write-Host '[ENUM] WinPEAS batch fallback.'
     $binaryOutput = Join-Path $capture 'winpeas-output.txt'
     if (Test-Path -LiteralPath $binaryOutput) {
         Move-Item -LiteralPath $binaryOutput -Destination (Join-Path $capture 'winpeas-binary-partial.txt')
     }
     try {
-        $status = Invoke-CapturedProcess 'cmd.exe' "/d /c `"$winpeasBat`"" $binaryOutput $ToolTimeoutSeconds
+        Clear-EnumCaptureState $binaryOutput
+        $trustedCmd = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
+        if (-not (Test-TrustedSystemBinary $trustedCmd)) { throw 'System command interpreter verification failed.' }
+        $status = Invoke-CapturedProcess $trustedCmd "/d /c `"$winpeasBat`"" $binaryOutput $ToolTimeoutSeconds
         $winpeasOk = $status -eq 'checked'
         $status = if ($winpeasOk) { 'batch-fallback' } else { "batch-$status" }
+        if ($status -eq 'batch-cleanup-failed') { $winpeasStatus = 'cleanup-failed' }
         Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "winpeas`t$status"
     } catch {
         Write-Warning "WinPEAS batch failed: $($_.Exception.Message)"
@@ -1647,6 +2117,23 @@ if (-not (Test-Path -LiteralPath (Join-Path $capture 'winpeas-output.txt'))) {
 $privescStatus = if ($privescJob) { Complete-EnumJob $privescJob } else { 'unavailable' }
 $privescComplete = $privescStatus -eq 'checked'
 Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "privesccheck`t$privescStatus"
+$enumCleanupFailed = $sharpStatus -eq 'cleanup-failed' -or $winpeasStatus -eq 'cleanup-failed' -or $privescStatus -eq 'cleanup-failed'
+$enumLifecycleComplete = $true
+} finally {
+    if (-not $enumLifecycleComplete) {
+        foreach ($entry in $enumJobs) {
+            try {
+                $entry.Deadline = [DateTime]::UtcNow
+                Stop-EnumJob $entry
+            } catch { }
+        }
+        foreach ($entry in $enumJobs) {
+            try {
+                if ((Complete-EnumJob $entry) -eq 'cleanup-failed') { $enumCleanupFailed = $true }
+            } catch { $enumCleanupFailed = $true }
+        }
+    }
+}
 
 foreach ($entry in @(@('winpeas', 'winpeas-output.txt'), @('winpeas-binary-partial', 'winpeas-binary-partial.txt'), @('privesccheck', 'privesccheck-output.txt'))) {
     $raw = Join-Path $capture $entry[1]
@@ -1672,12 +2159,25 @@ if ($aieLM -eq 1 -and $aieCU -eq 1) {
     Write-Finding 'installer-policy' 'AlwaysInstallElevated enabled in both hives; gated recipe needed'
 }
 try {
-    $unquoted = @(Get-CimInstance Win32_Service | Where-Object {
-        $_.PathName -match '^\s*[^"\s][^" ]* [^"].*\.exe' -and $_.StartName -match 'LocalSystem|LocalService|NetworkService'
-    })
-    if ($unquoted.Count -gt 0) {
-        Write-Finding 'service-paths' "$($unquoted.Count) privileged unquoted paths; check writable segments before use"
+    $serviceKeys = @(Get-ChildItem -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services' -ErrorAction Stop)
+    $unquotedCount = 0
+    $unreadableCount = 0
+    foreach ($serviceKey in $serviceKeys) {
+        try {
+            $service = Get-ItemProperty -LiteralPath $serviceKey.PSPath -ErrorAction Stop
+        } catch {
+            $unreadableCount++
+            continue
+        }
+        if ([string]$service.ObjectName -match '^(LocalSystem|NT AUTHORITY\\(LocalService|NetworkService))$' -and
+            [string]$service.ImagePath -match '^\s*[^"\s][^" ]* [^"].*\.exe') {
+            $unquotedCount++
+        }
     }
+    if ($unquotedCount -gt 0) {
+        Write-Finding 'service-paths' "$unquotedCount privileged unquoted paths; check writable segments before use"
+    }
+    if ($unreadableCount -gt 0) { Write-Warning "$unreadableCount service definitions could not be read." }
 } catch { Write-Warning 'Service path check failed.' }
 
 if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Edamame-NG\Lab\WeakService') {
@@ -1706,7 +2206,7 @@ if (Test-SystemIdentity) {
     Write-Finding 'local-elevation' 'Administrator membership detected; UAC elevation available'
 } elseif ($weakLabState) {
     $recipe = 'weak-service-lab'
-    Write-Finding 'local-elevation' 'Standard-user SYSTEM route verified on the exact disposable weak-service fixture'
+    Write-Finding 'local-elevation' 'Exact weak-service fixture prerequisites verified; SYSTEM proof requires a successful attempt'
 }
 $enumStatus = if ($winpeasOk -and $privescComplete) { 'checked' } else { 'unsupported' }
 Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "External local enumerator capture`t$enumStatus`tWinPEAS and PrivescCheck completion only"
@@ -1777,15 +2277,30 @@ foreach ($area in $domainSubItems) {
     Add-Content -LiteralPath (Join-Path $runDir 'coverage.tsv') -Value "$area`t$status`tdomain sub-item with no reviewed automatic recipe; the parent Active Directory row does not assert it"
 }
 
+# A failed collector run cannot publish named raw output, ZIP output, or a
+# success marker. The collector rows above remain private run evidence.
+if ($enumCleanupFailed) {
+    Write-Warning 'Enumerator cleanup failed; no final collector output or success marker was published.'
+    exit 1
+}
+
 # Alerts above precede these final output filenames.
+$confirmedRaw = @{}
+if ($winpeasStatus -ne 'cleanup-failed') { $confirmedRaw['winpeas-output.txt'] = $true }
+if ($privescStatus -ne 'cleanup-failed') { $confirmedRaw['privesccheck-output.txt'] = $true }
+if ($sharpStatus -ne 'cleanup-failed') { $confirmedRaw['sharphound-output.txt'] = $true }
+if ($winpeasStatus -ne 'cleanup-failed' -and (Test-Path -LiteralPath (Join-Path $capture 'winpeas-binary-partial.txt'))) {
+    $confirmedRaw['winpeas-binary-partial.txt'] = $true
+}
 foreach ($name in @('winpeas-output.txt', 'winpeas-binary-partial.txt', 'privesccheck-output.txt', 'sharphound-output.txt')) {
+    if (-not $confirmedRaw.ContainsKey($name)) { continue }
     $from = Join-Path $capture $name
     if (Test-Path -LiteralPath $from) {
         Move-Item -LiteralPath $from -Destination (Join-Path $runDir $name)
         Write-Host "[SAVED] $name"
     }
 }
-if ($sharpCollectedZip -and (Test-Path -LiteralPath $sharpCollectedZip.FullName)) {
+if ($sharpStatus -eq 'checked' -and $sharpCollectedZip -and (Test-Path -LiteralPath $sharpCollectedZip.FullName)) {
     Move-Item -LiteralPath $sharpCollectedZip.FullName -Destination (Join-Path $runDir 'sharphound.zip')
     Write-Host '[SAVED] sharphound.zip'
 }

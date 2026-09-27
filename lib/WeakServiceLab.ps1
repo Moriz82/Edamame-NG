@@ -178,10 +178,9 @@ function Invoke-WeakServiceLabRecipe([string]$ExpectedFixtureId) {
     $random = [Security.Cryptography.RandomNumberGenerator]::Create()
     try { $random.GetBytes($nonceBytes) } finally { $random.Dispose() }
     $nonce = [BitConverter]::ToString($nonceBytes).Replace('-', '')
-    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
     $pipeAcl = New-Object IO.Pipes.PipeSecurity
     $pipeAcl.SetAccessRuleProtection($true, $false)
-    foreach ($allowed in @($sid, (New-Object Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-18'))) {
+    foreach ($allowed in @((New-Object Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-18'))) {
         $rule = New-Object IO.Pipes.PipeAccessRule -ArgumentList $allowed, ([IO.Pipes.PipeAccessRights]::ReadWrite), ([Security.AccessControl.AccessControlType]::Allow)
         $pipeAcl.AddAccessRule($rule)
     }
@@ -219,9 +218,11 @@ try {
     # trusted cmd.exe service image launches the encoded SYSTEM child promptly.
     $changedPath = '"' + $trustedCmd + '" /d /c ' + $trustedPowerShell +
         ' -NoProfile -WindowStyle Hidden -EncodedCommand ' + $clientEncoded
-    if ($changedPath.Length -gt 30000) {
+    # Older service-control implementations can reject longer image paths and
+    # then fail to read them back, preventing reliable rollback.
+    if ($changedPath.Length -gt 4000) {
         $pipe.Dispose()
-        Write-Warning 'Service command exceeds Windows process limit'
+        Write-Warning 'Service command exceeds the verified service-control limit'
         return $false
     }
 
@@ -307,8 +308,8 @@ while (`$true) {
             $changedState[2] -ne '3' -or $changedState[3] -ne '1') {
             throw 'Weak-service fixture changed before start'
         }
-        $starter = Start-Process -FilePath $trustedSc -ArgumentList @('start', 'EdamameWeakSvc') -PassThru -WindowStyle Hidden
         $connected = $pipe.BeginWaitForConnection($null, $null)
+        $starter = Start-Process -FilePath $trustedSc -ArgumentList @('start', 'EdamameWeakSvc') -PassThru -WindowStyle Hidden
         if (-not $connected.AsyncWaitHandle.WaitOne(20000)) { throw 'SYSTEM pipe connection timed out' }
         $pipe.EndWaitForConnection($connected)
         $writer = New-Object IO.BinaryWriter -ArgumentList $pipe
