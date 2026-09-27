@@ -80,6 +80,15 @@ try {
     if ((Get-CredLedgerAttempts $ledger (Get-Key 'smb' 'EDALAB\other' '192.0.2.10' '445')) -ne 0) {
         throw 'A different account shared a counter'
     }
+    Set-Content -LiteralPath $ledger -Value @($rows[0], ($rows[1] -replace "`t2`t", "`tbad`t")) -Encoding ASCII
+    $threw = $false
+    try { Get-CredLedgerAttempts $ledger $base } catch { $threw = $true }
+    if (-not $threw) { throw 'A corrupt attempt count was treated as unused' }
+    Set-Content -LiteralPath $ledger -Value @($rows[0], $rows[1], $rows[1]) -Encoding ASCII
+    $threw = $false
+    try { Get-CredLedgerAttempts $ledger $base } catch { $threw = $true }
+    if (-not $threw) { throw 'Duplicate attempt rows were treated as one' }
+    Set-Content -LiteralPath $ledger -Value $rows -Encoding ASCII
     $foreign = Join-Path $scratch 'foreign.tsv'
     Set-Content -LiteralPath $foreign -Value 'someone elses data' -Encoding ASCII
     $threw = $false
@@ -101,11 +110,11 @@ try {
     Set-Content -LiteralPath $policy -Value "lockout_threshold=3`nreset=automatic" -Encoding ASCII
     $CredLockoutFile = $policy
     $parsed = Get-CredPolicy $null
-    if ($parsed[0] -cne 'operator-policy-threshold-3' -or [int]$parsed[1] -ne 3) { throw 'The policy ceiling was not read' }
+    if ($parsed[0] -cne 'operator-policy-threshold-3' -or [int]$parsed[1] -ne 1) { throw 'The policy must not raise the one-attempt cap' }
     if ($parsed[2] -notmatch '^[0-9A-F]{64}$') { throw 'The policy digest was not recorded' }
     Set-Content -LiteralPath $policy -Value "lockout_threshold=9" -Encoding ASCII
     $capped = Get-CredPolicy $null
-    if ([int]$capped[1] -ne 3) { throw 'The policy ceiling is not capped at three attempts' }
+    if ([int]$capped[1] -ne 1) { throw 'The policy must not raise the one-attempt cap' }
     Set-Content -LiteralPath $policy -Value 'reset=automatic' -Encoding ASCII
     $threw = $false
     try { Get-CredPolicy $null } catch { $threw = $true }
@@ -135,6 +144,7 @@ try {
     # ---- structural guarantees about the credential block -----------------
     $text = Get-Content -LiteralPath $runner -Raw
     if ($text -notmatch 'WNetAddConnection2') { throw 'The SMB authenticator is not WNetAddConnection2' }
+    if ($text -notmatch 'WNetCancelConnection2') { throw 'The temporary SMB connection is not removed' }
     # Isolate the credential block, stopping at the startup splash.
     $start = $text.IndexOf('# Operator-supplied credential validation')
     if ($start -lt 0) { throw 'The credential block is missing' }
@@ -143,6 +153,14 @@ try {
     if ($end -gt 0) { $block = $block.Substring(0, $end) }
     if ($text -notmatch 'CONNECT_TEMPORARY') { throw 'The SMB connection is not temporary' }
     if ($text -notmatch 'dwUsage = 1') { throw 'The SMB connection is not connectable-only' }
+    if ($block -notmatch '\$CredPort -ne 445') { throw 'The WNet adapter accepts a port it cannot address' }
+    if ($block -notmatch 'ToLowerInvariant\(\)') { throw 'Case changes could create a new SMB attempt budget' }
+    if ($block -notmatch 'WNetAddConnection2\(\[ref\]\$resource, \$credSecret, \$credUser, 4\)') {
+        throw 'The SMB connection is not marked temporary'
+    }
+    if ($block -notmatch 'Set-CredLedgerAttempts[\s\S]*WNetAddConnection2') {
+        throw 'The attempt was not reserved before authentication'
+    }
     foreach ($forbidden in @('Start-Process', 'Invoke-Expression', 'iex ', 'cmd /c', 'cmd.exe /c')) {
         if ($block -match [regex]::Escape($forbidden)) {
             throw "The credential block can reach a shell: $forbidden"

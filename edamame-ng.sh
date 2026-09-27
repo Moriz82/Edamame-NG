@@ -378,19 +378,43 @@ cred_ledger_open() {
   [[ ! -L $CRED_LEDGER ]] || return 1
   header='key	service	endpoint	account	attempts	first_utc	last_utc'
   if [[ ! -e $CRED_LEDGER ]]; then
-    (umask 077; : > "$CRED_LEDGER") || return 1
+    (umask 077; printf '%s\n' "$header" > "$CRED_LEDGER") || return 1
   fi
   [[ -f $CRED_LEDGER ]] || return 1
-  if IFS= read -r first < "$CRED_LEDGER"; then
-    [[ $first == "$header" ]] || return 1
-  else
-    printf '%s\n' "$header" >> "$CRED_LEDGER" || return 1
-  fi
+  IFS= read -r first < "$CRED_LEDGER" || return 1
+  [[ $first == "$header" ]] || return 1
   chmod 600 "$CRED_LEDGER" 2>/dev/null || return 1
 }
 
+cred_ledger_lock() {
+  local dir=${CRED_LEDGER%/*}
+  [[ $dir == "$CRED_LEDGER" ]] && dir='.'
+  mkdir -p "$dir" 2>/dev/null || return 1
+  CRED_LOCK_DIR="${CRED_LEDGER}.lock"
+  (umask 077; mkdir "$CRED_LOCK_DIR") 2>/dev/null || return 1
+  # A killed process can leave the lock behind. Refuse later attempts until
+  # the operator checks the ledger and removes that stale lock deliberately.
+  trap 'rmdir "$CRED_LOCK_DIR" 2>/dev/null || true' EXIT
+}
+
+cred_ledger_unlock() {
+  rmdir "$CRED_LOCK_DIR" 2>/dev/null || return 1
+  CRED_LOCK_DIR=''
+  trap - EXIT
+}
+
 cred_ledger_get() {
-  awk -F '\t' -v key="$CRED_KEY" 'FNR>1 && $1==key {print $5; exit}' "$CRED_LEDGER" 2>/dev/null
+  awk -F '\t' -v key="$CRED_KEY" '
+    FNR>1 && $1==key {
+      seen++
+      if ($5 !~ /^[0-9]+$/ || length($5)>6) bad=1
+      else count=$5
+    }
+    END {
+      if (bad || seen>1) exit 2
+      if (seen) print count
+      else print 0
+    }' "$CRED_LEDGER" 2>/dev/null
 }
 
 cred_ledger_add() {
@@ -429,7 +453,9 @@ cred_policy() {
   ((threshold >= 1)) || { printf 'Lockout threshold must be at least 1.\n' >&2; return 1; }
   CRED_POLICY_DIGEST=$(sha256_file "$file") || { printf 'Cannot hash lockout policy file.\n' >&2; return 1; }
   [[ -n $CRED_POLICY_DIGEST ]] || { printf 'Cannot hash lockout policy file.\n' >&2; return 1; }
-  CRED_POLICY_ALLOWED=$(( threshold < 3 ? threshold : 3 ))
+  # A policy file records context; it is not live proof of the endpoint's
+  # effective lockout policy. Every account/endpoint check gets one attempt.
+  CRED_POLICY_ALLOWED=1
   CRED_POLICY_BASIS="operator-policy-threshold-$threshold"
 }
 
@@ -445,7 +471,7 @@ cred_run_bounded() {
     timeout "$CRED_RUN_TIMEOUT" "$@"
     return $?
   fi
-  "$@"
+  return 125
 }
 
 cred_tcp_reachable() {
@@ -460,7 +486,7 @@ cred_tcp_reachable() {
     timeout "$CRED_CONNECT_TIMEOUT" "$BASH" -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$1" "$2" 2>/dev/null
     return $?
   fi
-  "$BASH" -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$1" "$2" 2>/dev/null
+  return 125
 }
 
 cred_ssh_host_known() {
@@ -488,20 +514,18 @@ cred_adapter_available() {
 }
 
 cred_smb_probe() {
-  local host=$1 port=$2 account=$3 name domain='' auth_dir auth_file rc
+  local host=$1 port=$2 account=$3 name domain='' rc
+  local -a auth_args
   if [[ $account == *\\* ]]; then domain=${account%%\\*}; name=${account#*\\};
   elif [[ $account == *@* ]]; then domain=${account#*@}; name=${account%%@*}; fi
-  auth_dir=$(mktemp -d "${TMPDIR:-/tmp}/edamame-cred.XXXXXXXX") || return 4
-  chmod 700 "$auth_dir" 2>/dev/null || { rm -rf "$auth_dir"; return 4; }
-  auth_file="$auth_dir/auth"
-  (umask 077; {
-    printf 'username = %s\n' "$name"
-    printf 'password = %s\n' "$CRED_SECRET"
-    [[ -z $domain ]] || printf 'domain = %s\n' "$domain"
-  } > "$auth_file") || { rm -rf "$auth_dir"; return 4; }
-  cred_run_bounded smbclient "//$host/IPC\$" -A "$auth_file" -N -m SMBDIGRAM -g -p "$port" -c quit >/dev/null 2>&1
+  [[ -n $name ]] || name=$account
+  auth_args=(-U "$name")
+  [[ -z $domain ]] || auth_args+=(-W "$domain")
+  # Samba reads the password from descriptor 0. A process killed during the
+  # attempt cannot leave a plaintext authentication file behind.
+  printf '%s\n' "$CRED_SECRET" | PASSWD_FD=0 cred_run_bounded smbclient "//$host/IPC\$" \
+    "${auth_args[@]}" -p "$port" -c quit >/dev/null 2>&1
   rc=$?
-  rm -rf "$auth_dir" 2>/dev/null
   return $rc
 }
 
@@ -548,14 +572,28 @@ if ((CRED_CHECK)); then
   CRED_RUN_TIMEOUT=$((10#$CRED_RUN_TIMEOUT))
   ((CRED_RUN_TIMEOUT >= 1 && CRED_RUN_TIMEOUT <= 300)) || { printf '--cred-timeout must be 1..300.\n' >&2; exit 2; }
   ((CRED_RUN_TIMEOUT > CRED_CONNECT_TIMEOUT)) || CRED_CONNECT_TIMEOUT=$CRED_RUN_TIMEOUT
+  command -v timeout >/dev/null 2>&1 || {
+    printf 'Credential validation requires timeout; no authentication was attempted.\n' >&2
+    exit 2
+  }
+  CRED_LEDGER=${CRED_LEDGER:-$CACHE_BASE/credential-ledger.tsv}
+  cred_ledger_lock || {
+    printf 'Credential ledger is busy or has a stale lock; no authentication was attempted.\n' >&2
+    exit 2
+  }
   cred_ledger_open || { printf 'Credential ledger unavailable.\n' >&2; exit 2; }
   cred_policy || exit 2
-  CRED_KEY=$(printf '%s|%s|%s' "$CRED_SERVICE" "$CRED_ACCOUNT" "$CRED_HOST:$CRED_PORT" | cred_stdin_sha256) || {
+  CRED_KEY_ACCOUNT=$CRED_ACCOUNT
+  if [[ $CRED_SERVICE == smb ]]; then CRED_KEY_ACCOUNT=$(printf '%s' "$CRED_ACCOUNT" | LC_ALL=C tr '[:upper:]' '[:lower:]'); fi
+  CRED_KEY_HOST=$(printf '%s' "$CRED_HOST" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+  CRED_KEY=$(printf '%s|%s|%s' "$CRED_SERVICE" "$CRED_KEY_ACCOUNT" "$CRED_KEY_HOST:$CRED_PORT" | cred_stdin_sha256) || {
     printf 'Cannot hash the credential key; a SHA-256 tool is required.\n' >&2; exit 2; }
   CRED_NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   CRED_ACCOUNT_MASKED=$(cred_mask "$CRED_ACCOUNT")
-  CRED_ATTEMPTS=$(cred_ledger_get || true)
-  [[ $CRED_ATTEMPTS =~ ^[0-9]{1,6}$ ]] || CRED_ATTEMPTS=0
+  CRED_ATTEMPTS=$(cred_ledger_get) || {
+    printf 'Credential ledger has a corrupt or duplicate attempt row; no authentication was attempted.\n' >&2
+    exit 2
+  }
   CRED_FIRST_UTC=$CRED_NOW
   cred_host_name=$(hostname -s 2>/dev/null || hostname)
   cred_host_name=${cred_host_name//[^A-Za-z0-9._-]/_}
@@ -607,6 +645,12 @@ if ((CRED_CHECK)); then
     exit 2
   fi
   [[ -n $CRED_SECRET && ${#CRED_SECRET} -le 1024 ]] || { printf 'Secret missing or longer than 1024 characters.\n' >&2; exit 2; }
+  # Reserve the single attempt while holding the ledger lock. A second
+  # process cannot race this one, and interruption after reservation cannot
+  # turn an unknown authentication result into a free retry.
+  CRED_ATTEMPTS=$((CRED_ATTEMPTS + 1))
+  cred_ledger_add || { printf 'Credential ledger update failed; no authentication was attempted.\n' >&2; exit 2; }
+  cred_ledger_unlock || { printf 'Credential ledger lock could not be released; no authentication was attempted.\n' >&2; exit 2; }
   if [[ $CRED_SERVICE == smb ]]; then
     cred_smb_probe "$CRED_HOST" "$CRED_PORT" "$CRED_ACCOUNT"
     cred_rc=$?
@@ -616,9 +660,7 @@ if ((CRED_CHECK)); then
   fi
   CRED_SECRET=''
   unset CRED_SECRET
-  CRED_ATTEMPTS=$((CRED_ATTEMPTS + 1))
   cred_record "$CRED_ATTEMPTS" "$cred_rc"
-  cred_ledger_add || { printf 'Credential ledger update failed.\n' >&2; exit 2; }
   case $cred_rc in
     0)
       printf '[CRED] Accepted: %s at %s:%s over %s. Attempt %d of %d (policy %s).\n' \

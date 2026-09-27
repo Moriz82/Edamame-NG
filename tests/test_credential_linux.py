@@ -8,6 +8,7 @@ accounting, and secret-handling rules, not any endpoint's answer.
 """
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -63,8 +64,8 @@ def run(home, fake_bin, ledger, *args, secret=None, stdin_text=None, expect=None
         "XDG_CACHE_HOME": str(home / "cache"),
         "LANG": "C",
     }
-    for key in ("EDAMAME_FAKE_SMB_EXIT", "EDAMAME_FAKE_SSH_EXIT",
-                "EDAMAME_FAKE_PASSWORD_ENV", "EDAMAME_FAKE_AUTH_PATH"):
+    for key in ("EDAMAME_FAKE_SMB_EXIT", "EDAMAME_FAKE_SMB_SLEEP", "EDAMAME_FAKE_SSH_EXIT",
+                "EDAMAME_FAKE_PASSWORD_ENV", "EDAMAME_FAKE_LEDGER_PATH"):
         if key in os.environ:
             env[key] = os.environ[key]
     proc = subprocess.run(
@@ -89,6 +90,9 @@ def main():
         (home / "runs").mkdir()
         fake = base / "fake-bin"
         fake.mkdir()
+        timeout_binary = shutil.which("timeout")
+        assert timeout_binary, "the credential test needs a bounded timeout tool"
+        (fake / "timeout").symlink_to(timeout_binary)
         runs = home / "runs"
         ledger = home / "cache" / "ledger.tsv"
         record = base / "adapter-record.txt"
@@ -96,26 +100,21 @@ def main():
         write_exec(fake / "uname", "#!/bin/sh\necho Linux\n")
         write_exec(fake / "hostname", "#!/bin/sh\necho fixture-host\n")
         write_exec(fake / "id", "#!/bin/sh\necho 1000\n")
-        # Fake authenticator. It records the argument vector and the environment
-        # it was handed, plus whether its auth file existed, then answers from
-        # the fixture-controlled exit code.
+        # Fake authenticator. It records the argument vector, the descriptor
+        # number, and the password length, never the password itself.
         write_exec(fake / "smbclient", f"""#!/bin/sh
 {{
   printf 'ARGV:'
   for a in "$@"; do printf ' [%s]' "$a"; done
   printf '\\n'
   printf 'ENV_PASSWORD_PRESENT:%s\\n' "$([ -n "${{EDAMAME_FAKE_PASSWORD_ENV:-}}" ] && echo yes || echo no)"
-  for a in "$@"; do
-    case "$a" in
-      /*auth|*/auth) if [ -f "$a" ]; then
-          printf 'AUTHFILE_PRESENT:yes\\n'
-          printf 'AUTHFILE_USERNAME:%s\\n' "$(sed -n 's/^username = //p' "$a")"
-          printf 'AUTHFILE_PASSWORD_LEN:%s\\n' "$(sed -n 's/^password = //p' "$a" | tr -d '\\n' | wc -c | tr -d ' ')"
-        else printf 'AUTHFILE_PRESENT:no\\n'; fi ;;
-    esac
-  done
-  printf 'STILL_EXISTS_AFTER:%s\\n' "$([ -f "${{EDAMAME_FAKE_AUTH_PATH:-/nonexistent}}" ] && echo yes || echo no)"
+  printf 'PASSWD_FD:%s\\n' "${{PASSWD_FD:-missing}}"
+  printf 'STDIN_PASSWORD_LEN:%s\\n' "$(cat | tr -d '\\n' | wc -c | tr -d ' ')"
+  if [ -n "${{EDAMAME_FAKE_LEDGER_PATH:-}}" ]; then
+    printf 'LEDGER_AT_AUTH:%s\\n' "$(awk -F '\\t' 'NR==2{{print $5}}' "$EDAMAME_FAKE_LEDGER_PATH")"
+  fi
 }} >> "{record}"
+if [ -n "${{EDAMAME_FAKE_SMB_SLEEP:-}}" ]; then sleep "$EDAMAME_FAKE_SMB_SLEEP"; fi
 exit "${{EDAMAME_FAKE_SMB_EXIT:-0}}"
 """)
         write_exec(fake / "sshpass", f"""#!/bin/sh
@@ -195,12 +194,15 @@ exit 0
         env_export = os.environ.get("EDAMAME_TEST_SMB_EXIT")
         del env_export
         os.environ["EDAMAME_FAKE_SMB_EXIT"] = "0"
-        os.environ["EDAMAME_FAKE_AUTH_PATH"] = "/nonexistent-expected"
+        os.environ["EDAMAME_FAKE_LEDGER_PATH"] = str(ledger)
         proc = cred("--cred-account", ACCOUNT, "--cred-endpoint", f"127.0.0.1:{port}",
                     "--cred-service", "smb", "--cred-secret-stdin",
                     secret=SECRET + "\n", expect=0)
         assert f"Accepted: {MASKED}" in proc.stdout, proc.stdout
         assert invocations() == 1
+        assert "LEDGER_AT_AUTH:1" in record.read_text(), "the attempt must be reserved before authentication"
+        assert "[-m]" not in record.read_text(), "do not pass an unsupported Samba protocol name"
+        assert "[-N]" not in record.read_text(), "do not suppress the supplied descriptor password"
         row = _latest_attempt(runs)
         assert row.split("\t")[3] == MASKED, row
         assert row.split("\t")[4] == "unverified-single-attempt", row
@@ -214,6 +216,46 @@ exit 0
         assert "Refused" in proc.stderr and "1 of 1 permitted attempts" in proc.stderr
         assert invocations() == 0, "a refused attempt must not reach the authenticator"
         assert "limit-reached" in _latest_attempt(runs)
+
+        # Two simultaneous invocations of a fresh key must share one budget.
+        race_ledger = home / "cache" / "race-ledger.tsv"
+        record.unlink(missing_ok=True)
+        race_env = {
+            "PATH": f"{fake}:/usr/bin:/bin", "HOME": str(home),
+            "TMPDIR": str(home / "tmp"), "XDG_CACHE_HOME": str(home / "cache"),
+            "LANG": "C", "EDAMAME_FAKE_SMB_EXIT": "0",
+            "EDAMAME_FAKE_SMB_SLEEP": "0.2",
+            "EDAMAME_FAKE_LEDGER_PATH": str(race_ledger),
+        }
+        race_args = ["bash", str(SCRIPT), "--verify-credential", "--output-dir", str(runs),
+                     "--cred-ledger", str(race_ledger), "--cred-account", ACCOUNT,
+                     "--cred-endpoint", f"127.0.0.1:{port}", "--cred-service", "smb",
+                     "--cred-secret-stdin"]
+        racers = [subprocess.Popen(race_args, env=race_env, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True) for _ in range(2)]
+        outcomes = [p.communicate(SECRET + "\n", timeout=60) for p in racers]
+        assert sorted(p.returncode for p in racers) == [0, 2], outcomes
+        assert record.read_text().count("ARGV:") == 1, "concurrent checks reached the authenticator twice"
+        assert race_ledger.read_text().splitlines()[1].split("\t")[4] == "1"
+        record.unlink(missing_ok=True)
+
+        # SMB account names are case-insensitive; changing their case cannot
+        # create another budget. A damaged matching row must fail closed.
+        cred("--cred-account", ACCOUNT.lower(), "--cred-endpoint", f"127.0.0.1:{port}",
+             "--cred-service", "smb", "--cred-secret-stdin", secret=SECRET, expect=2)
+        assert invocations() == 0
+        corrupt = home / "cache" / "corrupt-ledger.tsv"
+        lines = ledger.read_text().splitlines()
+        fields = lines[1].split("\t")
+        fields[4] = "bad-count"
+        corrupt.write_text(lines[0] + "\n" + "\t".join(fields) + "\n")
+        damaged = run(home, fake, corrupt, "--verify-credential", "--output-dir", str(runs),
+                      "--cred-ledger", str(corrupt), "--cred-account", ACCOUNT,
+                      "--cred-endpoint", f"127.0.0.1:{port}", "--cred-service", "smb",
+                      "--cred-secret-stdin", secret=SECRET, expect=2)
+        assert "corrupt or duplicate" in damaged.stderr
+        assert invocations() == 0
 
         # --- binding: a different account, port, or service is a separate key
         port2 = free_port()
@@ -258,7 +300,7 @@ exit 0
             if "_ARGV" in line or line.startswith("SSH_ARGV"):
                 assert SECRET not in line, line
 
-        # --- an operator lockout policy raises the ceiling, and only to it ---
+        # --- an operator policy is recorded but cannot raise the one-attempt cap ---
         policy = home / "policy.txt"
         policy.write_text("lockout_threshold=2\nreset=automatic\n")
         policy.chmod(0o600)
@@ -273,14 +315,24 @@ exit 0
         os.environ["EDAMAME_FAKE_SMB_EXIT"] = "1"
         first = policy_cred()
         assert first.returncode == 1, f"{first.returncode}\n{first.stdout}\n{first.stderr}"
-        second = policy_cred()
-        assert second.returncode == 1, f"{second.returncode}\n{second.stdout}\n{second.stderr}"
         proc = policy_cred()
         assert proc.returncode == 2, proc.stderr
-        assert "2 of 2 permitted attempts" in proc.stderr
+        assert "1 of 1 permitted attempts" in proc.stderr
         row = _latest_attempt(runs)
         assert row.split("\t")[4] == "operator-policy-threshold-2", row
         assert len(row.split("\t")[5]) == 64, "policy digest must be recorded"
+
+        # An existing lock fails closed, including one left by a killed run.
+        locked_ledger = home / "cache" / "locked-ledger.tsv"
+        (home / "cache" / "locked-ledger.tsv.lock").mkdir(mode=0o700)
+        before = invocations()
+        locked = run(home, fake, locked_ledger, "--verify-credential", "--output-dir", str(runs),
+                     "--cred-ledger", str(locked_ledger), "--cred-account", ACCOUNT,
+                     "--cred-endpoint", f"127.0.0.1:{port}", "--cred-service", "smb",
+                     "--cred-secret-stdin", secret=SECRET, expect=2)
+        assert "stale lock" in locked.stderr
+        assert invocations() == before, "a busy ledger must block authentication"
+        (home / "cache" / "locked-ledger.tsv.lock").rmdir()
 
         # --- an unverifiable or tampered policy is refused -------------------
         weak = home / "weak.txt"
@@ -306,16 +358,16 @@ exit 0
             "--cred-service", "smb", "--cred-secret-stdin", secret=SECRET, expect=2)
 
         # --- secret handling -------------------------------------------------
-        # The auth file existed for the authenticator, carried the operator
-        # secret, and was removed before the runner returned.
+        # Samba reads the operator secret from descriptor 0. No temporary
+        # plaintext authentication file is created.
         text = record.read_text()
-        assert "AUTHFILE_PRESENT:yes" in text, text
-        assert "AUTHFILE_USERNAME:edatest" in text, text
-        assert f"AUTHFILE_PASSWORD_LEN:{len(SECRET)}" in text, text
+        assert "PASSWD_FD:0" in text, text
+        assert f"STDIN_PASSWORD_LEN:{len(SECRET)}" in text, text
+        assert "[-U] [edatest]" in text, text
+        assert "[-W] [EDALAB]" in text, text
         assert "ENV_PASSWORD_PRESENT:no" in text, "the secret must not travel in the environment"
-        assert "STILL_EXISTS_AFTER:no" in text, "the auth file must be removed after the attempt"
-        # The secret must appear in no command vector, only in the SMB auth file
-        # and the SSH adapter's standard input.
+        # The secret must appear in no command vector or environment; SMB and
+        # SSH receive it only on a standard-input descriptor.
         vectors = [line for line in text.splitlines() if "_ARGV" in line]
         assert vectors, text
         for line in vectors:

@@ -1,5 +1,35 @@
 # Credential validation and coverage-gate acceptance, 2026-09-26
 
+## Independent review, 2026-09-27
+
+The reviewer found four defects in the new credential path and corrected them.
+The Linux SMB adapter had passed an unsupported protocol name and `-N` to
+`smbclient`. It now uses Samba's documented `PASSWD_FD` input and `-p` port
+option, without writing a plaintext authentication file. The Windows network
+API cannot select an SMB port; the runner now accepts only port 445, requests a
+temporary connection, and attempts to remove it after success. A cleanup
+failure is inconclusive and is recorded as such. Both runners now reserve the
+single allowed attempt in the ledger before authentication, under a lock, so
+interruption or concurrent processes cannot turn an unknown outcome into a
+free retry. An operator-supplied policy file remains context and cannot raise
+the one-attempt limit without independent verification of the endpoint's
+effective policy. Corrupt or duplicate matching ledger rows fail closed.
+
+The revised Linux credential fixture passed, including simultaneous checks
+against one ledger key: one reached the fake authenticator and one was refused.
+Bash syntax, ShellCheck, the
+Linux scan and catalog suites, failure-path tests, and checklist coverage gate
+also passed. The Windows credential tests were updated, but no PowerShell
+runtime was installed on this reviewer workstation, so this revision has no
+new Windows execution result. The test server address answered ICMP and TCP
+during review, but its identity was not confirmed and no guest was run.
+Current guest, native PowerShell 3, and live credential acceptance remain
+unproven for this revision.
+
+References: [Samba smbclient manual](https://www.samba.org/samba/docs/4.15/man-html/smbclient.1.html),
+[Microsoft WNetAddConnection2](https://learn.microsoft.com/en-us/windows/win32/api/winnetwk/nf-winnetwk-wnetaddconnection2w),
+and [Microsoft WNetCancelConnection2](https://learn.microsoft.com/en-us/windows/win32/api/winnetwk/nf-winnetwk-wnetcancelconnection2w).
+
 ## What this record covers
 
 This run added operator-supplied credential validation to both runners, added a
@@ -32,11 +62,12 @@ helper, and the Linux test plants a secret-shaped value in a capture file and
 proves it never reaches the authenticator.
 
 The attempt is bound to `SHA-256(service|account|host:port)`. A different
-account, host, port, or service gets its own budget. Without an operator
-lockout policy the budget is one attempt per account and endpoint, held in a
-mode-0600 ledger, and a second attempt is refused **before** the secret is read
-and **before** any authenticator runs. The test asserts the authenticator was
-not invoked on the refused attempt.
+account, host, port, or service gets its own budget. The budget is one attempt
+per account and endpoint, held in a mode-0600 ledger. An operator-supplied
+policy file records its threshold and digest but does not raise the budget,
+because it does not verify the endpoint's effective policy. A second attempt
+is refused **before** the secret is read and **before** any authenticator runs.
+The test asserts the authenticator was not invoked on the refused attempt.
 
 Three conditions record their reason and make no authentication attempt, so
 they do not spend the budget: the endpoint did not accept a TCP connection, the
@@ -54,7 +85,7 @@ file under the run directory and asserts the secret appears in none of them.
 | --- | --- |
 | Argument validation and mutually exclusive modes | refused, exit 2, no authenticator invoked |
 | Attempt budget, no policy | 1 accepted, second refused with `limit-reached` |
-| Attempt budget, operator policy `lockout_threshold=2` | 2 attempts, third refused |
+| Attempt budget, operator policy `lockout_threshold=2` | 1 attempt, second refused |
 | Binding: account, host, port, service | 3 distinct ledger rows, each counting separately |
 | Unreachable endpoint | `endpoint-unreachable`, no attempt recorded, budget intact |
 | Missing authenticator | refused before the secret was read |

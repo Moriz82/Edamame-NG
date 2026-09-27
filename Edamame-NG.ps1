@@ -404,12 +404,20 @@ function Get-CredLedgerAttempts([string]$Path, [string]$Key) {
     $header = 'key' + "`t" + 'service' + "`t" + 'endpoint' + "`t" + 'account' + "`t" + 'attempts' + "`t" + 'first_utc' + "`t" + 'last_utc'
     $lines = @(Get-Content -LiteralPath $Path)
     if (-not $lines.Count -or $lines[0] -cne $header) { throw 'Credential ledger has a foreign header.' }
+    $found = $false
+    $attempts = 0
     for ($i = 1; $i -lt $lines.Count; $i++) {
         if (-not $lines[$i]) { continue }
         $fields = $lines[$i] -split "`t"
-        if ($fields[0] -ceq $Key -and $fields[4] -match '^[0-9]{1,6}$') { return [int]$fields[4] }
+        if ($fields[0] -ceq $Key) {
+            if ($found -or $fields.Count -lt 7 -or $fields[4] -cnotmatch '^[0-9]{1,6}$') {
+                throw 'Credential ledger has a corrupt or duplicate attempt row.'
+            }
+            $found = $true
+            $attempts = [int]$fields[4]
+        }
     }
-    return 0
+    return $attempts
 }
 
 function Set-CredLedgerAttempts([string]$Path, [string]$Key, [int]$Attempts, [string]$First, [string]$Last, $Harden) {
@@ -457,8 +465,9 @@ function Get-CredPolicy($AclCheck) {
     }
     if ($threshold -lt 1) { throw 'Lockout policy file needs an integer lockout_threshold.' }
     $digest = (Get-FileHash -LiteralPath $CredLockoutFile -Algorithm SHA256).Hash
-    if ($threshold -gt 3) { $threshold = 3 }
-    return @("operator-policy-threshold-$threshold", $threshold, $digest)
+    # A supplied file is useful context, but it does not verify the remote
+    # endpoint's effective policy. Keep the per-account check to one attempt.
+    return @("operator-policy-threshold-$threshold", 1, $digest)
 }
 
 function Test-CredEndpointReachable([string]$HostName, [int]$Port, [int]$TimeoutMs) {
@@ -486,7 +495,8 @@ if ($VerifyCredential) {
         $CredPort = [int]$Matches[1]
     }
     if ($CredPort -lt 1 -or $CredPort -gt 65535) { throw 'Invalid endpoint port.' }
-    $CredKeySource = "$CredService|$CredAccount|$CredHost`:$CredPort"
+    if ($CredPort -ne 445) { throw 'The Windows SMB adapter supports only port 445.' }
+    $CredKeySource = "$CredService|$($CredAccount.ToLowerInvariant())|$($CredHost.ToLowerInvariant())`:$CredPort"
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
         $credKey = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($CredKeySource))).Replace('-', '')
@@ -500,12 +510,13 @@ if ($VerifyCredential) {
         New-Item -ItemType Directory -Path $credLedgerDir -Force | Out-Null
     }
     $ledgerHeader = 'key' + "`t" + 'service' + "`t" + 'endpoint' + "`t" + 'account' + "`t" + 'attempts' + "`t" + 'first_utc' + "`t" + 'last_utc'
-    $existing = $null
-    if (Test-Path -LiteralPath $credLedgerPath) {
+    $ledgerExists = Test-Path -LiteralPath $credLedgerPath
+    if ($ledgerExists) {
         $existing = @(Get-Content -LiteralPath $credLedgerPath)
+        if (-not $existing.Count -or $existing[0] -cne $ledgerHeader) { throw 'Credential ledger has a foreign header.' }
+    } else {
+        Set-Content -LiteralPath $credLedgerPath -Value $ledgerHeader -Encoding ASCII
     }
-    if ($existing -and $existing[0] -cne $ledgerHeader) { throw 'Credential ledger has a foreign header.' }
-    if (-not $existing) { Set-Content -LiteralPath $credLedgerPath -Value $ledgerHeader -Encoding ASCII }
     Set-PrivateFile $credLedgerPath
     $policy = Get-CredPolicy { param($policyPath) Test-PrivateFileAcl $policyPath }
     $policyBasis = $policy[0]
@@ -581,6 +592,9 @@ public static class EdamameWnet
 
     [DllImport("mpr.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "WNetAddConnection2W")]
     public static extern int WNetAddConnection2(ref NETRESOURCE netResource, string password, string username, int flags);
+
+    [DllImport("mpr.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "WNetCancelConnection2W")]
+    public static extern int WNetCancelConnection2(string name, int flags, bool force);
 }
 '@
     }
@@ -594,11 +608,48 @@ public static class EdamameWnet
     $resource.lpComment = $null
     $resource.lpProvider = $null
     $credUser = if ($credDomain) { "$credDomain\$credName" } else { $credName }
-    $credCode = [EdamameWnet]::WNetAddConnection2([ref]$resource, $credSecret, $credUser, 0)
-    $credSecret = $null
-    $credAttempts = $credAttempts + 1
-    Write-CredAttempt $credAttempts ([string]$credCode)
-    Set-CredLedgerAttempts $credLedgerPath $credKey $credAttempts $credFirst $credNow { Set-PrivateFile $credLedgerPath }
+    # Reserve under an OS file lock before authentication. A concurrent run or
+    # interrupted process cannot turn an unknown result into a free retry.
+    $credLockPath = "$credLedgerPath.lock"
+    $credLockStream = $null
+    $credLimitReached = $false
+    try {
+        try {
+            $credLockStream = [IO.File]::Open($credLockPath, [IO.FileMode]::OpenOrCreate,
+                                              [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        } catch { throw 'Credential ledger is busy; no authentication was attempted.' }
+        Set-PrivateFile $credLockPath
+        $credAttempts = Get-CredLedgerAttempts $credLedgerPath $credKey
+        if ($credAttempts -ge $policyAllowed) {
+            $credLimitReached = $true
+        } else {
+            $credAttempts = $credAttempts + 1
+            Set-CredLedgerAttempts $credLedgerPath $credKey $credAttempts $credFirst $credNow { Set-PrivateFile $credLedgerPath }
+        }
+    } catch {
+        $credSecret = $null
+        throw
+    } finally {
+        if ($credLockStream) { $credLockStream.Dispose() }
+    }
+    if ($credLimitReached) {
+        $credSecret = $null
+        Write-Warning ("Refused {0} at {1}:{2}: {3} of {4} permitted attempts already recorded. No authentication was attempted." -f $credMasked, $CredHost, $CredPort, $credAttempts, $policyAllowed)
+        Stop-Credential 2 'limit-reached'
+    }
+    $credCode = -1
+    $credCancelCode = 0
+    try {
+        $credCode = [EdamameWnet]::WNetAddConnection2([ref]$resource, $credSecret, $credUser, 4) # CONNECT_TEMPORARY
+    } catch {
+        $credCode = -1
+    } finally {
+        $credSecret = $null
+        if ($credCode -eq 0) {
+            try { $credCancelCode = [EdamameWnet]::WNetCancelConnection2($resource.lpRemoteName, 0, $false) }
+            catch { $credCancelCode = -1 }
+        }
+    }
     # 0 accepted, 1326 logon failure, 1331 disabled, 1327 disabled,
     # 1909 account locked out, 53/67/1219 network or path, 85 unknown share.
     $credResult = switch ($credCode) {
@@ -610,6 +661,12 @@ public static class EdamameWnet
         1909 { 'rejected' }
         default { 'indeterminate' }
     }
+    if ($credCode -eq 0 -and $credCancelCode -ne 0) {
+        $credResult = 'indeterminate'
+        Write-Warning ("SMB authentication succeeded, but the temporary connection could not be removed (code {0})." -f $credCancelCode)
+    }
+    $credRecord = if ($credCode -eq 0 -and $credCancelCode -ne 0) { "cleanup-failed-$credCancelCode" } else { [string]$credCode }
+    Write-CredAttempt $credAttempts $credRecord
     if ($credResult -eq 'accepted') {
         Write-Host ("[CRED] Accepted: {0} at {1}:{2} over {3}. Attempt {4} of {5} (policy {6})." -f $credMasked, $CredHost, $CredPort, $CredService, $credAttempts, $policyAllowed, $policyBasis)
         Write-Host "[SAVED] $credAttemptsPath"
