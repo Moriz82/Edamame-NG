@@ -983,7 +983,9 @@ start_enum_capture() {
   ((pending_signal == 0)) || exit "$pending_signal"
   ((monitor_enabled)) || set +m
   identity=$(ps -p "${enum_pids[$index]}" -o pgid= -o lstart=)
-  group=${identity%% *}
+  # ps pads its fields, so split on whitespace the way read does. Process
+  # substitution, not a here-string: no temporary file is needed.
+  { read -r group _; } < <(printf '%s\n' "$identity")
   own_group=$(ps -p "$$" -o pgid= | tr -d ' ')
   if [[ $group != "${enum_pids[$index]}" || $group == "$own_group" || -z $own_group ]]; then
     # No tool has been authorized yet; only the waiting supervisor exists.
